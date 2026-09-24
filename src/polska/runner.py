@@ -200,10 +200,11 @@ class AgentRunner:
         """Run a worker agent (engineer, marketer, support, analyst) against a task.
 
         Owns the task's transition out of ``queued``: it moves to ``running`` before
-        the call and to exactly one of ``done``, ``awaiting_approval`` or ``failed``
-        after, depending on what the agent returned and what the gate did with any
-        actions it proposed. The caller decides *whether* to run this task; this
-        method is what actually running it means.
+        the call and to one of ``done``, ``awaiting_approval``, ``failed`` or
+        ``abandoned`` after, depending on what the agent returned, what the gate did
+        with any actions it proposed, and whether this was the task's last permitted
+        attempt (see :meth:`_fail_or_abandon`). The caller decides *whether* to run
+        this task; this method is what actually running it means.
         """
         task.transition_to(TaskState.RUNNING)
         session.commit()
@@ -221,16 +222,13 @@ class AgentRunner:
 
         result = outcome.output
         if not isinstance(result, AgentResult):
-            task.transition_to(
-                TaskState.FAILED,
-                error=outcome.run.error or "The agent's output did not validate.",
+            self._fail_or_abandon(
+                session, task, outcome.run.error or "The agent's output did not validate."
             )
-            session.commit()
             return outcome
 
         if not result.succeeded:
-            task.transition_to(TaskState.FAILED, error=result.failure_reason)
-            session.commit()
+            self._fail_or_abandon(session, task, result.failure_reason)
             return outcome
 
         any_pending = False
@@ -255,6 +253,50 @@ class AgentRunner:
         session.commit()
         return outcome
 
+    def _fail_or_abandon(self, session: Session, task: Task, reason: str) -> None:
+        """Move a task out of ``running`` after a failure, to ``failed`` if it may
+        still be retried, or to ``abandoned`` if this was its last attempt.
+
+        Without this, a task that exhausts ``limits.max_attempts`` would sit in
+        ``failed`` forever, and ``failed`` suppresses a fresh planner proposal for
+        the same work unconditionally, by design, on the reasoning that it is the
+        orchestrator's own retry queue. Once there is no more retrying to do, that
+        reasoning no longer holds: the task must become ``abandoned``, the one state
+        the dedup rules never suppress, or the underlying need goes quiet with
+        nothing left that will ever try it again.
+
+        ``failed`` itself is not requeued here: whether and when to retry a failed
+        task is a scheduling decision (capacity, budget, backoff) that belongs to
+        the orchestrator's loop, not to one invocation of the runner.
+        """
+        exhausted = task.attempts >= self._config.limits.max_attempts
+        if exhausted:
+            task.transition_to(
+                TaskState.ABANDONED,
+                result={
+                    "abandoned_reason": reason,
+                    "attempts": task.attempts,
+                    "max_attempts": self._config.limits.max_attempts,
+                },
+            )
+            summary = f"Abandoned after {task.attempts} attempt(s): {reason}"
+            kind = ActivityKind.TASK_STATE_CHANGED
+        else:
+            task.transition_to(TaskState.FAILED, error=reason)
+            summary = (
+                f"Failed (attempt {task.attempts}/{self._config.limits.max_attempts}): {reason}"
+            )
+            kind = ActivityKind.TASK_STATE_CHANGED
+        session.commit()
+        log(
+            session,
+            company_id=task.company_id,
+            kind=kind,
+            summary=summary,
+            task_id=task.id,
+            error=reason,
+        )
+
     async def _invoke(
         self,
         session: Session,
@@ -275,24 +317,23 @@ class AgentRunner:
         except BudgetExceeded as exc:
             # Recorded as a Run, the same as any other outcome, rather than left as
             # a bare exception: "every ceiling crossing is recorded" means a row
-            # exists to show it, not just a log line that scrolled past.
-            run = self._build_run_row(
-                session,
-                agent_name=agent_name,
+            # exists to show it, not just a log line that scrolled past. Written
+            # directly as budget_blocked, never as running: the SDK was never
+            # called, so there is no async gap for a crash to land in here.
+            run = Run(
                 company_id=company_id,
-                task=task,
+                task_id=task.id if task else None,
+                agent=agent_name,
                 model=model,
-                system_prompt="",
-                user_prompt=user_prompt,
-                raw_output=None,
+                prompt=user_prompt,
                 tools_called=[],
-                usage=(0, 0, 0, 0, 0.0),
                 status=RunStatus.BUDGET_BLOCKED,
                 error=str(exc),
-                started=utcnow(),
-                session_id=None,
+                started_at=utcnow(),
+                finished_at=utcnow(),
                 duration_ms=0,
             )
+            session.add(run)
             session.commit()
             log(
                 session,
@@ -333,16 +374,16 @@ class AgentRunner:
         overshoot = self._budget.check_run_did_not_overshoot(
             session, company_id=company_id, run=run
         )
-        if overshoot is not None:
+        for halt in overshoot:
             log(
                 session,
                 company_id=company_id,
                 kind=ActivityKind.BUDGET_HALT,
-                summary=f"Run {run.id} exceeded its own token reservation",
+                summary=f"Run {run.id} exceeded its own {halt.limit_name} reservation",
                 task_id=task.id if task else None,
                 run_id=run.id,
                 approval_id=None,
-                error=overshoot.reason,
+                error=halt.reason,
             )
 
         log(
@@ -373,10 +414,6 @@ class AgentRunner:
     ) -> tuple[Run, BaseModel | None]:
         system_prompt = build_system_prompt(agent_name, agent_config, company=company_profile)
         schema = schema_model.model_json_schema()
-        max_run_tokens = self._config.budget.max_tokens_per_run
-        max_budget_usd = self._config.price_for(model).cost_usd(
-            input_tokens=0, output_tokens=max_run_tokens
-        )
 
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
@@ -390,7 +427,26 @@ class AgentRunner:
             max_turns=agent_config.max_turns,
             cwd=str(cwd) if cwd is not None else None,
             output_format={"type": "json_schema", "schema": schema},
-            max_budget_usd=max_budget_usd,
+            # The SDK's own enforcement of the same figure the reservation holds.
+            # Belt and braces, not a replacement for the reservation: this can stop
+            # a run mid-flight; the reservation is what stops two runs racing the
+            # ledger before either has spent anything.
+            max_budget_usd=self._config.budget.max_usd_per_run,
+        )
+
+        # Written before the SDK is ever called, in `running` state, so a crash
+        # between here and the call completing leaves a real row behind rather than
+        # a silent gap: that row is exactly what reconcile_orphaned_runs recovers at
+        # the next process start. Everything below updates this same row in place.
+        run = self._create_running_run(
+            session,
+            agent_name=agent_name,
+            company_id=company_id,
+            task=task,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            started=started,
         )
 
         tools_called: list[dict[str, Any]] = []
@@ -417,32 +473,24 @@ class AgentRunner:
             if result_message is None:
                 # The CLI never yielded a ResultMessage before raising; take what we
                 # can from the exception itself so the failure is still legible.
-                result_message = None
                 raw_output = exc.result
         except (CLIConnectionError, CLINotFoundError):
             # This is not "this task failed", it is "the CLI is not usable at all".
-            # Record what happened so it is not silent, then let it propagate: a
-            # broken install should stop the caller, not be swallowed per-task.
-            status = RunStatus.FAILED
-            error_text = "The Claude Agent SDK's CLI could not be reached or found."
-            run = self._build_run_row(
+            # The row already exists in `running`; close it out so it does not sit
+            # there looking orphaned, then let the exception propagate: a broken
+            # install should stop the caller, not be swallowed per-task.
+            self._finalize_run(
                 session,
-                agent_name=agent_name,
-                company_id=company_id,
-                task=task,
-                model=model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
+                run=run,
                 raw_output=None,
                 tools_called=tools_called,
                 usage=(0, 0, 0, 0, 0.0),
-                status=status,
-                error=error_text,
-                started=started,
+                status=RunStatus.FAILED,
+                error="The Claude Agent SDK's CLI could not be reached or found.",
                 session_id=None,
                 duration_ms=None,
+                started=started,
             )
-            session.commit()
             raise
 
         if result_message is not None:
@@ -475,24 +523,18 @@ class AgentRunner:
                 validated = None
 
         usage = _extract_usage(result_message, self._config, model)
-        run = self._build_run_row(
+        self._finalize_run(
             session,
-            agent_name=agent_name,
-            company_id=company_id,
-            task=task,
-            model=model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
+            run=run,
             raw_output=raw_output,
             tools_called=tools_called,
             usage=usage,
             status=status,
             error=error_text,
-            started=started,
             session_id=result_message.session_id if result_message else None,
             duration_ms=result_message.duration_ms if result_message else None,
+            started=started,
         )
-        session.commit()
         return run, validated
 
     @staticmethod
@@ -516,7 +558,7 @@ class AgentRunner:
                         if call["id"] == block.tool_use_id:
                             call["is_error"] = bool(block.is_error)
 
-    def _build_run_row(
+    def _create_running_run(
         self,
         session: Session,
         *,
@@ -526,43 +568,64 @@ class AgentRunner:
         model: str,
         system_prompt: str,
         user_prompt: str,
-        raw_output: str | None,
-        tools_called: list[dict[str, Any]],
-        usage: tuple[int, int, int, int, float],
-        status: RunStatus,
-        error: str | None,
         started: Any,
-        session_id: str | None,
-        duration_ms: int | None,
     ) -> Run:
-        input_tokens, output_tokens, cache_read, cache_creation, cost_usd = usage
-        fx_rate = self._config.budget.usd_to_gbp
-        finished = utcnow()
+        """Write the row before the SDK is ever called. See the module docstring
+        and ``reconcile_orphaned_runs`` for why: a crash after this point leaves a
+        real row behind, not a silent gap in the ledger."""
         run = Run(
             company_id=company_id,
             task_id=task.id if task else None,
             agent=agent_name,
             model=model,
-            session_id=session_id,
             system_prompt=system_prompt,
             prompt=user_prompt,
-            raw_output=raw_output,
-            tools_called=tools_called,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_read_tokens=cache_read,
-            cache_creation_tokens=cache_creation,
-            cost_usd=cost_usd,
-            cost_gbp=cost_usd * fx_rate,
-            fx_rate=fx_rate,
-            status=status,
-            error=error,
-            duration_ms=duration_ms
-            if duration_ms is not None
-            else int((finished - started).total_seconds() * 1000),
+            tools_called=[],
+            status=RunStatus.RUNNING,
             started_at=started,
-            finished_at=finished,
         )
         session.add(run)
-        session.flush()
+        session.commit()
+        return run
+
+    def _finalize_run(
+        self,
+        session: Session,
+        *,
+        run: Run,
+        raw_output: str | None,
+        tools_called: list[dict[str, Any]],
+        usage: tuple[int, int, int, int, float],
+        status: RunStatus,
+        error: str | None,
+        session_id: str | None,
+        duration_ms: int | None,
+        started: Any,
+    ) -> Run:
+        """Update the row :meth:`_create_running_run` wrote, in place, with what
+        actually happened. Never creates a second row: one dispatch is one row,
+        whatever its outcome."""
+        input_tokens, output_tokens, cache_read, cache_creation, cost_usd = usage
+        fx_rate = self._config.budget.usd_to_gbp
+        finished = utcnow()
+
+        run.session_id = session_id
+        run.raw_output = raw_output
+        run.tools_called = tools_called
+        run.input_tokens = input_tokens
+        run.output_tokens = output_tokens
+        run.cache_read_tokens = cache_read
+        run.cache_creation_tokens = cache_creation
+        run.cost_usd = cost_usd
+        run.cost_gbp = cost_usd * fx_rate
+        run.fx_rate = fx_rate
+        run.status = status
+        run.error = error
+        run.duration_ms = (
+            duration_ms
+            if duration_ms is not None
+            else int((finished - started).total_seconds() * 1000)
+        )
+        run.finished_at = finished
+        session.commit()
         return run

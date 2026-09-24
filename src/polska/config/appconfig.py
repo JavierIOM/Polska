@@ -48,29 +48,45 @@ class BudgetConfig(BaseModel):
     """Hard ceilings. Crossing one stops the scheduler and writes a BudgetHalt.
 
     There is no soft mode and no degraded mode. A ceiling is a stop.
+
+    The ledger the guard enforces against is denominated in dollars, not tokens.
+    Tokens are not a fungible unit across models: an Opus token and a Haiku token
+    do not cost the same, so summing raw counts across every agent's runs would make
+    a day-or-company ceiling meaningless the moment two different models are in
+    play, which they are from the shipped config onwards. Dollars, computed from the
+    same pricing table that already prices every run, are the only unit that adds up
+    correctly across models.
+
+    ``max_tokens_per_run`` survives as a same-model, single-run safety net: it bounds
+    one call's raw output size, which is a real thing worth capping independently of
+    price (a pricing-table mistake should not also mean unbounded output). It is
+    never used to derive a dollar figure. ``max_usd_per_run`` is the actual per-run
+    cost ceiling, enforced two ways: passed to the SDK as ``max_budget_usd`` so the
+    CLI stops itself mid-run, and reserved in full against the day and company
+    ledgers before the run starts, since that reservation, not a token estimate, is
+    what the SDK is contracted to hold the run to.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     max_tokens_per_run: int = Field(default=200_000, ge=1)
-    max_tokens_per_day: int = Field(default=2_000_000, ge=1)
-    max_tokens_per_company: int = Field(default=50_000_000, ge=1)
+    max_usd_per_run: float = Field(default=3.0, gt=0)
     max_usd_per_day: float = Field(default=10.0, gt=0)
     max_usd_per_company: float = Field(default=250.0, gt=0)
     #: Frozen into each run row so a later rate change cannot rewrite old costs.
     usd_to_gbp: float = Field(default=0.79, gt=0)
 
     @model_validator(mode="after")
-    def _daily_within_lifetime(self) -> Self:
-        if self.max_tokens_per_day > self.max_tokens_per_company:
+    def _run_within_day_within_company(self) -> Self:
+        if self.max_usd_per_day > self.max_usd_per_company:
             raise ValueError(
-                "max_tokens_per_day is above max_tokens_per_company, so the lifetime "
+                "max_usd_per_day is above max_usd_per_company, so the lifetime "
                 "ceiling would be hit inside a single day and the daily one could "
                 "never fire."
             )
-        if self.max_tokens_per_run > self.max_tokens_per_day:
+        if self.max_usd_per_run > self.max_usd_per_day:
             raise ValueError(
-                "max_tokens_per_run is above max_tokens_per_day. One run would exhaust the day."
+                "max_usd_per_run is above max_usd_per_day. One run would exhaust the day."
             )
         return self
 

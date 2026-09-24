@@ -29,7 +29,7 @@ from polska.budget import BudgetGuard
 from polska.config.appconfig import AppConfig
 from polska.config.company import CompanyProfile
 from polska.db.enums import AgentName, ApprovalStatus, RunStatus, TaskState
-from polska.db.models import Approval, Company, Task
+from polska.db.models import Approval, Company, Run, Task
 from polska.runner import AgentRunner
 
 
@@ -293,8 +293,6 @@ async def test_a_cli_connection_error_is_recorded_then_reraised(
             session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
         )
 
-    from polska.db.models import Run
-
     run = session.execute(select(Run)).scalar_one()
     assert run.status == RunStatus.FAILED
 
@@ -513,3 +511,172 @@ async def test_a_run_blocked_by_budget_never_calls_the_sdk(
     session.refresh(task)
     assert task.state == TaskState.FAILED
     assert task.error is not None and "ceiling" in task.error.lower()
+
+
+async def test_a_blocked_reservation_never_reaches_running_state_in_the_ledger(
+    session, app_config: AppConfig, registry: AdapterRegistry, company: Company, task: Task
+) -> None:
+    """The budget_blocked row is written directly, since the SDK is never called
+    and there is no async gap for a crash to land in: it must never sit around
+    looking like an in-flight run that reconcile_orphaned_runs would need to
+    recover."""
+    tight = app_config.model_copy(
+        update={"budget": app_config.budget.model_copy(update={"max_usd_per_day": 0.0000001})}
+    )
+    guard = BudgetGuard(tight)
+    runner = AgentRunner(
+        app_config=tight,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(_result_message()),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft something.",
+    )
+
+    run = session.execute(select(Run)).scalar_one()
+    assert run.status == RunStatus.BUDGET_BLOCKED
+
+
+async def test_the_run_row_exists_in_running_state_before_the_sdk_is_ever_called(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """The fix for the crash case: a Run row must be visible in the database in
+    'running' state before the SDK call happens, not only after it returns. This is
+    what lets reconcile_orphaned_runs find real spend a dead process never got to
+    record, instead of a silent gap."""
+    seen_mid_call: list[RunStatus] = []
+
+    def spying_query(*, prompt: str, options: object):
+        # At this point the runner must already have committed the row.
+        row = session.execute(select(Run)).scalar_one()
+        seen_mid_call.append(row.status)
+
+        async def gen():
+            yield _result_message(structured_output={"tasks": [], "no_action_reason": "none"})
+
+        return gen()
+
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=spying_query,
+    )
+
+    await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert seen_mid_call == [RunStatus.RUNNING]
+    # And exactly one row exists afterwards too: the same row was updated in place,
+    # not superseded by a second one.
+    final_row = session.execute(select(Run)).scalar_one()
+    assert final_row.status == RunStatus.SUCCEEDED
+
+
+async def test_a_cli_connection_error_updates_the_existing_row_not_a_second_one(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query_raising(CLIConnectionError("cli not found")),
+    )
+
+    with pytest.raises(CLIConnectionError):
+        await runner.run_planner(
+            session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+        )
+
+    rows = session.execute(select(Run)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == RunStatus.FAILED
+
+
+# --------------------------------------------------------------------- retries
+
+
+async def test_a_failure_with_attempts_remaining_stays_failed_not_abandoned(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    assert app_config.limits.max_attempts > 1
+    output = {"succeeded": False, "summary": "Nope.", "failure_reason": "transient error"}
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft something.",
+    )
+
+    session.refresh(task)
+    assert task.state == TaskState.FAILED
+    assert task.attempts < app_config.limits.max_attempts
+
+
+async def test_exhausting_retries_abandons_the_task_instead_of_leaving_it_failed(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """Without this, a task that runs out of attempts would sit in 'failed'
+    forever, and 'failed' suppresses a fresh planner proposal for the same work
+    unconditionally. Only 'abandoned' is exempt from that. This is the fix."""
+    output = {"succeeded": False, "summary": "Nope.", "failure_reason": "still broken"}
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    for _attempt in range(app_config.limits.max_attempts):
+        session.refresh(task)
+        if task.state == TaskState.FAILED:
+            task.transition_to(TaskState.QUEUED)
+            session.commit()
+        await runner.run_worker(
+            session,
+            agent_name=AgentName.MARKETER,
+            task=task,
+            company_profile=_profile(),
+            user_prompt="Draft something.",
+        )
+
+    session.refresh(task)
+    assert task.attempts == app_config.limits.max_attempts
+    assert task.state == TaskState.ABANDONED
+    assert task.result["attempts"] == app_config.limits.max_attempts
+    assert "still broken" in task.result["abandoned_reason"]

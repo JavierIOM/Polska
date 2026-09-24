@@ -21,9 +21,13 @@ limits:
 budget:
   # Hard stops. Crossing one halts the scheduler and writes a BudgetHalt row.
   # Nothing degrades, nothing retries past a limit.
+  #
+  # Denominated in dollars, not tokens: an Opus token and a Haiku token do not
+  # cost the same, so a raw cross-model token sum would make a ceiling
+  # meaningless. max_tokens_per_run is the one token figure left, and it is a
+  # same-model, single-run output-size safety net, never used to price anything.
   max_tokens_per_run: 200000
-  max_tokens_per_day: 2000000
-  max_tokens_per_company: 50000000
+  max_usd_per_run: 3.0
   max_usd_per_day: 10.0
   max_usd_per_company: 250.0
   # Frozen into each run at write time so a rate change never rewrites history.

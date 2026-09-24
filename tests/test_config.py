@@ -65,12 +65,12 @@ def test_integrations_ship_in_dry_run(app_config: AppConfig) -> None:
 
 def test_a_daily_ceiling_above_the_lifetime_one_is_refused() -> None:
     with pytest.raises(ValidationError, match="inside a single day"):
-        BudgetConfig(max_tokens_per_day=100, max_tokens_per_company=50)
+        BudgetConfig(max_usd_per_day=100, max_usd_per_company=50)
 
 
 def test_a_run_ceiling_above_the_daily_one_is_refused() -> None:
     with pytest.raises(ValidationError, match="exhaust the day"):
-        BudgetConfig(max_tokens_per_run=2_000_000, max_tokens_per_day=1_000_000)
+        BudgetConfig(max_usd_per_run=20.0, max_usd_per_day=10.0)
 
 
 def test_a_zero_fx_rate_is_refused() -> None:

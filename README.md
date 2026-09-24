@@ -88,16 +88,33 @@ These are not negotiable and the tests enforce several of them.
   adapter should read; they cannot contain the value. Approval payloads are stored in
   SQLite and rendered on the dashboard, so a credential-looking key in one is refused
   by the schema.
-- **A ceiling is a stop.** No soft mode, no degradation, no retry past a limit. Budget
-  is reserved before a run starts and released when it ends, not just summed from
-  `runs` after the fact: a reservation is what stops two concurrent dispatches from
-  both reading the same stale total and together crossing a ceiling neither would have
-  crossed alone.
+- **A ceiling is a stop, denominated in dollars.** No soft mode, no degradation, no
+  retry past a limit. Tokens are not fungible across models, so the ledger and every
+  day/company ceiling are dollars, computed from the same pricing table that prices
+  every run; `max_tokens_per_run` is the one token figure left, a same-model,
+  single-run output-size safety net that is never used to price anything. Budget is
+  reserved (`max_usd_per_run` in full) before a run starts and released when it ends,
+  not just summed from `runs` after the fact: a reservation is what stops two
+  concurrent dispatches from both reading the same stale total and together crossing
+  a ceiling neither would have crossed alone.
+- **A crash mid-run is not zero spend.** Every run is written to the database in
+  `running` state *before* the SDK is ever called, and updated in place once it
+  finishes. If the process dies in between, that row is left behind rather than
+  silently missing, and `reconcile_orphaned_runs` — which **must run once at process
+  start, before phase 3's scheduler takes its first tick** — prices it at its
+  reservation's worst case, not zero, and re-checks the ceilings against that worse
+  number immediately.
 - **Every agent names its model and its tool allowlist explicitly.** Nothing is
   inherited. An empty list means the agent reasons but touches nothing.
 - **Reversible actions run immediately; irreversible ones never do.** They write a
   full preview into `approvals` and stop, unless config explicitly auto-approves that
   action type, in which case the row still exists and says so.
+- **`failed` is not a place work goes to die.** A task that exhausts
+  `limits.max_attempts` becomes `abandoned`, never left sitting in `failed`, because
+  `failed` suppresses a fresh planner proposal for the same work unconditionally and
+  `abandoned` is the one state dedup never suppresses at any age. Retrying a `failed`
+  task that still has attempts left is a scheduling decision for phase 3's
+  orchestrator to make, not something the runner does on its own.
 
 ## Stack
 
@@ -166,7 +183,7 @@ suite needs one: every SDK call in it goes through a fake `query_fn`, never the 
 
 ## Tests
 
-174 tests, no network, about six seconds.
+184 tests, no network, about six seconds.
 
 The state machine is tested exhaustively rather than by example: all 36 ordered pairs
 of states are asserted legal or illegal against a table written independently of the
@@ -179,25 +196,37 @@ The approval gate is split across two files: `test_approval_gate.py` covers
 classification, fail-closed behaviour, the credential-in-payload refusal and the
 record's own lifecycle; `test_gate_dispatch.py` covers the phase 2 half, actually
 calling an adapter, the `force_dry_run` interception, and auto-approve.
-`test_budget_guard.py` includes a real concurrency test: several reservations fired
-at once with `asyncio.gather`, asserting exactly as many are granted as fit under the
-ceiling and the rest are refused, not just that the arithmetic is right in isolation.
+
+`test_budget_guard.py` covers three things review specifically asked to see proven,
+not just asserted: a real concurrency test (several reservations fired at once with
+`asyncio.gather`, asserting exactly as many are granted as fit under the dollar
+ceiling and the rest are refused); orphan recovery (`reconcile_orphaned_runs` finding
+a row left in `running` from a simulated crash, pricing it at the reservation's worst
+case rather than zero, and writing a halt when that worst case alone crosses a
+ceiling); and that a run overshooting either its dollar or its token safety net trips
+its own, independent halt.
+
 `test_runner.py` builds fake SDK message streams from the real `claude_agent_sdk`
-dataclasses and checks the runner's handling of success, a schema-invalid result, the
-CLI's own error result, a `ResultError` exception, a wall-clock timeout, a
-budget-blocked run that never calls the SDK at all, and a `CLIConnectionError`
-propagating past a Run row rather than being swallowed as an ordinary task failure.
+dataclasses and checks: success; a schema-invalid result; the CLI's own error result;
+a `ResultError` exception; a wall-clock timeout; a budget-blocked run that never
+calls the SDK at all; a `CLIConnectionError` propagating past a Run row rather than
+being swallowed as an ordinary task failure; that the Run row exists in `running`
+state *before* the SDK is invoked, confirmed by a fake that queries the database
+mid-call; that a `CLIConnectionError` updates that same row rather than leaving a
+second one behind; and that a task exhausting its retries becomes `abandoned`, not
+left in `failed` forever.
 
 `test_migrations.py` builds a database by running every migration and compares tables,
 columns, indexes and foreign keys against the models. The rest of the suite uses
 `create_all` for speed, which is only safe while that test passes.
 
-None of this has been run against a live Anthropic key. The fake `query_fn` is built
-from the SDK's real dataclasses and matches its documented behaviour as read from the
-installed package, but a schema built with nested Pydantic models (`$defs`/`$ref`) has
-not been confirmed to round-trip through the CLI's `--json-schema` flag against a real
-model. That is the first thing to check with a key in hand, before trusting this in
-production.
+**None of this has been run against a live Anthropic key**, and one attempt was
+blocked, not completed: a one-off script mirroring the runner's real request (a
+Pydantic schema with nested models, `$defs`/`$ref`, sent as `output_format` to
+`claude-haiku-4-5`) got as far as a real `ResultMessage` coming back — confirming the
+`ResultError`-after-a-yielded-result code path fires exactly as `runner.py` expects —
+before failing on "Credit balance is too low." The schema mechanics are unverified,
+not broken; check this again once the account has credit, before phase 3 leans on it.
 
 ## Conventions
 

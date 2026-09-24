@@ -49,6 +49,12 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     BUDGET_BLOCKED = "budget_blocked"
+    #: The process that started this run died before it could record what happened.
+    #: Real money may have been spent; actual usage is unknown. Never confused with
+    #: FAILED, which means the run finished and we know why. Recovered at the next
+    #: process start by reconcile_orphaned_runs, which prices it at the worst case
+    #: (its reservation) rather than assuming zero.
+    ORPHANED = "orphaned"
     INVALID_OUTPUT = "invalid_output"
 
 

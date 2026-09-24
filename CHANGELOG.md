@@ -5,6 +5,66 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-24
+
+Three correctness fixes to phase 2 raised in review, before phase 3 starts.
+
+### Changed
+
+- **The budget ledger is now denominated in dollars, not tokens.** Tokens are not
+  fungible across models: summing raw counts across an Opus run and a Haiku run made
+  a day-or-company ceiling meaningless. `BudgetConfig.max_tokens_per_day` and
+  `max_tokens_per_company` are removed; `max_usd_per_run` is added (was missing
+  entirely — only the day and company dollar ceilings existed before). The
+  reservation size is now always `max_usd_per_run` in full, also passed to the SDK
+  as `max_budget_usd` so both enforcement mechanisms agree on the same figure.
+  `max_tokens_per_run` survives as a same-model, single-run output-size safety net,
+  never used to derive a dollar estimate (the old worst-case estimate priced
+  `max_tokens_per_run` entirely at the output rate, which undercounts badly for a
+  tool-heavy agent whose input tokens can dwarf its output).
+- `BudgetGuard.check_run_did_not_overshoot` now returns `list[BudgetHalt]` (was
+  `BudgetHalt | None`): a run can overshoot its dollar reservation and its token
+  safety net independently, and both are worth a halt, not just the first one found.
+
+### Added
+
+- `RunStatus.ORPHANED` and `polska.budget.reconcile_orphaned_runs`: every `Run` is
+  now written to the database in `running` state *before* the SDK is ever called
+  (`AgentRunner._create_running_run` / `_finalize_run`, replacing the old
+  `_build_run_row` which only wrote a row after the call returned). A crash between
+  those two points previously left real, possibly-billed spend with no row at all —
+  invisible to a ledger defined as the sum of `runs`. `reconcile_orphaned_runs` finds
+  any row still `running` at process start (which can only mean a previous process
+  died mid-run), prices it at its reservation's worst case rather than assuming zero,
+  and re-checks the day/company ceilings against that worse number immediately,
+  writing a halt if the worst case alone crosses one. **Must be called once at
+  process start, before phase 3's scheduler takes its first tick** — this is not
+  wired into anything yet, since there is no process entrypoint until phase 3.
+- `AgentRunner._fail_or_abandon`: a task that exhausts `limits.max_attempts` now
+  becomes `abandoned` instead of being left in `failed`. Without this, the dedup fix
+  from 0.1.1 was incomplete: `failed` suppresses a fresh planner proposal
+  unconditionally (by design, since it's the orchestrator's own retry queue), and
+  with nothing ever moving a task out of `failed` once retries were exhausted, it
+  would suppress the same genuinely unmet need forever — exactly the failure mode
+  `abandoned`-never-suppresses was added to prevent. Retrying a `failed` task that
+  still has attempts left is left to phase 3's orchestrator (a scheduling decision:
+  capacity, budget, backoff), not done by the runner itself.
+- 5 new tests proving each fix rather than just re-asserting the new numbers: a
+  fake `query_fn` that queries the database mid-call to confirm the `Run` row exists
+  in `running` state before the SDK is invoked; a simulated crash (a pre-seeded
+  `running` row) recovered by `reconcile_orphaned_runs` and shown to trip a halt; a
+  task run to exhaustion across repeated `run_worker` calls, ending `abandoned` with
+  the reason and attempt count recorded. 184 tests total.
+
+### Notes
+
+- One live verification was attempted and blocked, not completed: a script sending
+  a Pydantic model with nested `$defs`/`$ref` as `output_format` to `claude-haiku-4-5`
+  got as far as a real `ResultMessage`, confirming the runner's
+  `ResultError`-after-a-result handling fires as designed, before failing on
+  "Credit balance is too low" — an account billing issue, not a schema bug. Retry
+  once the account has credit, before phase 3 relies on structured output.
+
 ## [0.2.0] - 2026-09-24
 
 Phase 2 of 5: agent runner, dry-run adapter, cost accounting.

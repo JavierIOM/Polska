@@ -10,10 +10,25 @@ The fix is a reservation held for the lifetime of one run, checked against actua
 spend plus every other reservation currently outstanding, atomically. Nothing here
 persists a reservation to the database: this process is single-process by design (one
 scheduler, one semaphore for concurrency), so an in-memory counter guarded by an
-``asyncio.Lock`` is enough. A crash loses outstanding reservations, never actual spend
-(nothing was committed to ``runs`` for a run that never finished), so the guard can
-only ever under-count on restart, never over-count, and it can never wrongly open a
-gate that should stay shut.
+``asyncio.Lock`` is enough.
+
+The ledger itself is denominated in dollars, not tokens. Tokens are not a fungible
+unit across models, and this project runs several: summing raw token counts across an
+Opus run and a Haiku run would make a day-or-company ceiling meaningless the moment
+two different models are in play, which they are from the shipped config onwards.
+Dollars, computed from the same pricing table that already prices every run, are the
+only unit that adds up correctly.
+
+Two things a naive reading of "reserve, then release" gets wrong, both fixed here:
+
+- A crash mid-run does not just lose an in-memory reservation, it loses a real,
+  already-billed API call with no ``Run`` row to show it, which is real spend a
+  sum-of-``runs`` ledger cannot see. :func:`reconcile_orphaned_runs` is the fix: every
+  run is written to the database in ``running`` state before the SDK is ever called,
+  so a crash leaves a row behind, not a silent gap, and the next process start prices
+  it at its reservation's worst case rather than assuming it cost nothing.
+- A dispatch that fails a check is recorded as loudly as one that succeeds: a
+  :class:`BudgetHalt` row is committed before :class:`BudgetExceeded` is raised.
 """
 
 from __future__ import annotations
@@ -25,8 +40,9 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from polska.activity import log
 from polska.config.appconfig import AppConfig, BudgetConfig
-from polska.db.enums import BudgetScope
+from polska.db.enums import ActivityKind, BudgetScope, RunStatus
 from polska.db.models import BudgetHalt, Run
 from polska.db.types import utcday, utcnow
 
@@ -35,15 +51,15 @@ from polska.db.types import utcday, utcnow
 class Reservation:
     """A held claim against the budget for one in-flight run.
 
-    ``tokens`` is always the run's full ceiling, not an estimate of what it will
-    likely use. See the module docstring for why: it is what makes the guard exact
-    rather than merely usually-right.
+    ``usd`` is always ``max_usd_per_run`` in full, not an estimate of what the run
+    will likely cost. That is what makes the guard exact rather than merely
+    usually-right, and it is also the figure ``max_budget_usd`` asks the SDK itself
+    to hold the run to, so the two enforcement mechanisms agree on the same number.
     """
 
     id: str
     company_id: int
     model: str
-    tokens: int
     usd: float
 
 
@@ -58,37 +74,18 @@ class BudgetExceeded(Exception):
         self.halt = halt
         super().__init__(
             f"{halt.scope.value} ceiling '{halt.limit_name}' would be crossed: "
-            f"{halt.observed_value:.0f} against a limit of {halt.limit_value:.0f}. "
+            f"${halt.observed_value:.4f} against a limit of ${halt.limit_value:.2f}. "
             f"{halt.reason}"
         )
 
 
-def _worst_case_usd(config: AppConfig, model: str, tokens: int) -> float:
-    """The most a reservation of ``tokens`` could possibly cost.
-
-    Priced entirely at the output rate, since output is always the more expensive
-    side and a reservation exists to be a safe upper bound, not an estimate.
-    """
-    price = config.price_for(model)
-    return price.cost_usd(input_tokens=0, output_tokens=tokens)
-
-
-def _actual_tokens(session: Session, company_id: int, *, since_day: str | None = None) -> int:
-    """Real token spend from committed ``Run`` rows. The only source of truth."""
-    total_expr = func.coalesce(
-        func.sum(
-            Run.input_tokens + Run.output_tokens + Run.cache_read_tokens + Run.cache_creation_tokens
-        ),
-        0,
-    )
-    stmt = select(total_expr).where(Run.company_id == company_id)
-    if since_day is not None:
-        stmt = stmt.where(func.strftime("%Y-%m-%d", Run.started_at) == since_day)
-    return int(session.execute(stmt).scalar_one())
-
-
 def _actual_usd(session: Session, company_id: int, *, since_day: str | None = None) -> float:
-    """Real dollar spend from committed ``Run`` rows."""
+    """Real dollar spend from committed ``Run`` rows. The only source of truth.
+
+    ``cost_usd`` already prices input, output and cache tokens at each run's own
+    model's rate (or the SDK's own reported cost, when it gave one), so this sum is
+    correct across a mix of models in a way a raw token count could never be.
+    """
     total_expr = func.coalesce(func.sum(Run.cost_usd), 0.0)
     stmt = select(total_expr).where(Run.company_id == company_id)
     if since_day is not None:
@@ -113,6 +110,34 @@ def active_halt(session: Session, company_id: int) -> BudgetHalt | None:
     return session.execute(stmt).scalar_one_or_none()
 
 
+def write_halt(
+    session: Session,
+    *,
+    company_id: int | None,
+    scope: BudgetScope,
+    limit_name: str,
+    limit_value: float,
+    observed_value: float,
+    period_key: str | None,
+    reason: str,
+) -> BudgetHalt:
+    """Record a crossed ceiling. Committed immediately: the stop is logged before
+    it takes effect, the same rule the approval gate follows for external effects."""
+    halt = BudgetHalt(
+        company_id=company_id,
+        scope=scope,
+        limit_name=limit_name,
+        limit_value=limit_value,
+        observed_value=observed_value,
+        period_key=period_key,
+        reason=reason,
+        created_at=utcnow(),
+    )
+    session.add(halt)
+    session.commit()
+    return halt
+
+
 class BudgetGuard:
     """Reserves budget before a run starts, releases it when the run ends.
 
@@ -130,20 +155,18 @@ class BudgetGuard:
     def budget(self) -> BudgetConfig:
         return self._config.budget
 
-    def _reserved_tokens(self, company_id: int) -> int:
-        """Tokens already claimed by other in-flight runs for this company."""
-        return sum(r.tokens for r in self._reservations.values() if r.company_id == company_id)
-
     def _reserved_usd(self, company_id: int) -> float:
+        """Dollars already claimed by other in-flight runs for this company."""
         return sum(r.usd for r in self._reservations.values() if r.company_id == company_id)
 
     async def reserve(self, session: Session, *, company_id: int, model: str) -> Reservation:
         """Claim one run's worth of budget, or raise :class:`BudgetExceeded`.
 
-        On success, the reservation is registered before the lock is released, so the
-        very next call sees it. On failure, a :class:`BudgetHalt` row is committed
-        before the exception is raised: the stop is recorded before it takes effect,
-        matching the same "log before you act" rule the approval gate follows.
+        The claim is always ``max_usd_per_run`` in full: not priced from the model
+        or from an assumed token count, because there is no reliable upper bound on
+        input tokens before a run starts (a tool-heavy agent can pull far more input
+        than it ever emits as output), and the configured dollar ceiling is the one
+        figure both this reservation and the SDK's own ``max_budget_usd`` agree on.
         """
         async with self._lock:
             existing = active_halt(session, company_id)
@@ -151,50 +174,7 @@ class BudgetGuard:
                 raise BudgetExceeded(existing)
 
             today = utcday()
-            run_tokens = self.budget.max_tokens_per_run
-            run_usd = _worst_case_usd(self._config, model, run_tokens)
-
-            day_tokens = (
-                _actual_tokens(session, company_id, since_day=today)
-                + self._reserved_tokens(company_id)
-                + run_tokens
-            )
-            if day_tokens > self.budget.max_tokens_per_day:
-                halt = self._write_halt(
-                    session,
-                    company_id=company_id,
-                    scope=BudgetScope.DAY,
-                    limit_name="max_tokens_per_day",
-                    limit_value=self.budget.max_tokens_per_day,
-                    observed_value=day_tokens,
-                    period_key=today,
-                    reason=(
-                        f"Reserving {run_tokens} tokens for a {model} run would bring "
-                        f"today's committed-plus-reserved total to {day_tokens}, over "
-                        f"the {self.budget.max_tokens_per_day} daily ceiling."
-                    ),
-                )
-                raise BudgetExceeded(halt)
-
-            company_tokens = (
-                _actual_tokens(session, company_id) + self._reserved_tokens(company_id) + run_tokens
-            )
-            if company_tokens > self.budget.max_tokens_per_company:
-                halt = self._write_halt(
-                    session,
-                    company_id=company_id,
-                    scope=BudgetScope.COMPANY,
-                    limit_name="max_tokens_per_company",
-                    limit_value=self.budget.max_tokens_per_company,
-                    observed_value=company_tokens,
-                    period_key=None,
-                    reason=(
-                        f"Reserving {run_tokens} tokens for a {model} run would bring "
-                        f"the company's lifetime total to {company_tokens}, over the "
-                        f"{self.budget.max_tokens_per_company} lifetime ceiling."
-                    ),
-                )
-                raise BudgetExceeded(halt)
+            run_usd = self.budget.max_usd_per_run
 
             day_usd = (
                 _actual_usd(session, company_id, since_day=today)
@@ -202,7 +182,7 @@ class BudgetGuard:
                 + run_usd
             )
             if day_usd > self.budget.max_usd_per_day:
-                halt = self._write_halt(
+                halt = write_halt(
                     session,
                     company_id=company_id,
                     scope=BudgetScope.DAY,
@@ -211,8 +191,8 @@ class BudgetGuard:
                     observed_value=day_usd,
                     period_key=today,
                     reason=(
-                        f"Reserving worst-case ${run_usd:.4f} for a {model} run would "
-                        f"bring today's committed-plus-reserved spend to ${day_usd:.4f}, "
+                        f"Reserving ${run_usd:.4f} for a {model} run would bring "
+                        f"today's committed-plus-reserved spend to ${day_usd:.4f}, "
                         f"over the ${self.budget.max_usd_per_day:.2f} daily ceiling."
                     ),
                 )
@@ -222,7 +202,7 @@ class BudgetGuard:
                 _actual_usd(session, company_id) + self._reserved_usd(company_id) + run_usd
             )
             if company_usd > self.budget.max_usd_per_company:
-                halt = self._write_halt(
+                halt = write_halt(
                     session,
                     company_id=company_id,
                     scope=BudgetScope.COMPANY,
@@ -231,19 +211,15 @@ class BudgetGuard:
                     observed_value=company_usd,
                     period_key=None,
                     reason=(
-                        f"Reserving worst-case ${run_usd:.4f} for a {model} run would "
-                        f"bring the company's lifetime spend to ${company_usd:.4f}, over "
-                        f"the ${self.budget.max_usd_per_company:.2f} lifetime ceiling."
+                        f"Reserving ${run_usd:.4f} for a {model} run would bring the "
+                        f"company's lifetime spend to ${company_usd:.4f}, over the "
+                        f"${self.budget.max_usd_per_company:.2f} lifetime ceiling."
                     ),
                 )
                 raise BudgetExceeded(halt)
 
             reservation = Reservation(
-                id=str(uuid.uuid4()),
-                company_id=company_id,
-                model=model,
-                tokens=run_tokens,
-                usd=run_usd,
+                id=str(uuid.uuid4()), company_id=company_id, model=model, usd=run_usd
             )
             self._reservations[reservation.id] = reservation
             return reservation
@@ -256,56 +232,156 @@ class BudgetGuard:
 
     def check_run_did_not_overshoot(
         self, session: Session, *, company_id: int, run: Run
-    ) -> BudgetHalt | None:
+    ) -> list[BudgetHalt]:
         """Catch a run whose *actual* usage exceeded its own reservation.
 
-        The reservation is sized at ``max_tokens_per_run`` precisely so this should
-        never fire. If it does, something under-priced the worst case (a pricing
-        table out of date, or a token count read wrong), and that is worth a halt and
-        an investigation, not a shrug. This is detection after the fact, not
-        prevention: the tokens are already spent. It exists so a mis-estimate is
-        caught loudly instead of quietly compounding on the next run.
+        Two independent checks, either or both of which can fire:
+
+        - ``max_usd_per_run``: the reservation's own unit. If the SDK's own
+          ``max_budget_usd`` let a run through over this, that enforcement has a
+          gap worth knowing about, not papering over.
+        - ``max_tokens_per_run``: the same-model safety net. Unrelated to cost, so a
+          cheap model generating an absurd number of tokens trips this independently
+          of whether it also cost more than expected.
+
+        Both are detection after the fact, not prevention: the spend already
+        happened. They exist so a mis-estimate is caught loudly instead of quietly
+        compounding on the next run.
         """
-        if run.total_tokens <= self.budget.max_tokens_per_run:
-            return None
-        return self._write_halt(
+        halts: list[BudgetHalt] = []
+
+        if run.cost_usd > self.budget.max_usd_per_run:
+            halts.append(
+                write_halt(
+                    session,
+                    company_id=company_id,
+                    scope=BudgetScope.RUN,
+                    limit_name="max_usd_per_run",
+                    limit_value=self.budget.max_usd_per_run,
+                    observed_value=run.cost_usd,
+                    period_key=None,
+                    reason=(
+                        f"Run {run.id} cost ${run.cost_usd:.4f} against a reservation "
+                        f"of ${self.budget.max_usd_per_run:.2f}. max_budget_usd was "
+                        "passed to the SDK for this exact figure; this means that "
+                        "enforcement did not hold, not that the ceiling does not apply."
+                    ),
+                )
+            )
+
+        if run.total_tokens > self.budget.max_tokens_per_run:
+            halts.append(
+                write_halt(
+                    session,
+                    company_id=company_id,
+                    scope=BudgetScope.RUN,
+                    limit_name="max_tokens_per_run",
+                    limit_value=self.budget.max_tokens_per_run,
+                    observed_value=run.total_tokens,
+                    period_key=None,
+                    reason=(
+                        f"Run {run.id} used {run.total_tokens} tokens against a "
+                        f"same-model safety net of {self.budget.max_tokens_per_run}."
+                    ),
+                )
+            )
+
+        return halts
+
+
+def reconcile_orphaned_runs(session: Session, app_config: AppConfig) -> list[Run]:
+    """Find every run left in ``running`` from a previous process, and close it out.
+
+    Call this exactly once, at process start, before the scheduler's first tick.
+    Within a single live process a ``running`` row only exists for the duration of
+    one in-flight SDK call; any such row still present when a *new* process starts
+    can only be left over from one that died mid-run.
+
+    That run was dispatched, which means it may have already been billed by
+    Anthropic, and there is no way now to learn what it actually used: the process
+    that would have read the result is the one that died. Recording it as zero
+    spend would under-count real money, and under-counting is exactly what let a
+    ceiling silently be crossed in the first place. So it is priced at its
+    reservation's worst case, ``max_usd_per_run``, the same figure that was held
+    against the ledger while it ran, and marked ``ORPHANED`` rather than ``FAILED``:
+    a task that failed and one whose actual outcome is simply unknown are different
+    facts, and collapsing them would hide which one happened.
+
+    After every orphan is priced in, the day and company ceilings are re-checked
+    against that now-worse ledger, per company. If the worst case alone is over a
+    ceiling, a halt is written immediately: the point of pricing the worst case is
+    exactly so this can catch it, rather than a healthy-looking ledger staying
+    healthy-looking until the real bill arrives.
+    """
+    orphans = list(session.execute(select(Run).where(Run.status == RunStatus.RUNNING)).scalars())
+    if not orphans:
+        return []
+
+    now = utcnow()
+    worst_case = app_config.budget.max_usd_per_run
+    fx_rate = app_config.budget.usd_to_gbp
+    affected_companies: set[int] = set()
+
+    for run in orphans:
+        run.status = RunStatus.ORPHANED
+        run.cost_usd = worst_case
+        run.cost_gbp = worst_case * fx_rate
+        run.fx_rate = fx_rate
+        run.finished_at = now
+        run.error = (
+            "The process was interrupted while this run was in progress. Real usage "
+            "is unknown; cost is recorded at the reservation's worst case "
+            f"(${worst_case:.2f}) for budget safety, not assumed to be zero."
+        )
+        affected_companies.add(run.company_id)
+    session.commit()
+
+    for company_id in affected_companies:
+        _log_orphan_recovery(session, app_config, company_id)
+
+    return orphans
+
+
+def _log_orphan_recovery(session: Session, app_config: AppConfig, company_id: int) -> None:
+    log(
+        session,
+        company_id=company_id,
+        kind=ActivityKind.ERROR,
+        summary="Recovered from an interrupted process: orphaned run(s) priced at worst case",
+        error="See the affected Run row(s) for detail.",
+    )
+
+    today = utcday()
+    day_usd = _actual_usd(session, company_id, since_day=today)
+    if day_usd > app_config.budget.max_usd_per_day:
+        write_halt(
             session,
             company_id=company_id,
-            scope=BudgetScope.RUN,
-            limit_name="max_tokens_per_run",
-            limit_value=self.budget.max_tokens_per_run,
-            observed_value=run.total_tokens,
-            period_key=None,
+            scope=BudgetScope.DAY,
+            limit_name="max_usd_per_day",
+            limit_value=app_config.budget.max_usd_per_day,
+            observed_value=day_usd,
+            period_key=today,
             reason=(
-                f"Run {run.id} used {run.total_tokens} tokens against a reservation "
-                f"of {self.budget.max_tokens_per_run}. The reservation is meant to be "
-                "a hard upper bound; this means it was mis-sized, not that the ceiling "
-                "does not apply."
+                "Worst-case pricing of a run orphaned by an interrupted process "
+                f"brings today's spend to ${day_usd:.4f}, over the "
+                f"${app_config.budget.max_usd_per_day:.2f} daily ceiling."
             ),
         )
 
-    def _write_halt(
-        self,
-        session: Session,
-        *,
-        company_id: int | None,
-        scope: BudgetScope,
-        limit_name: str,
-        limit_value: float,
-        observed_value: float,
-        period_key: str | None,
-        reason: str,
-    ) -> BudgetHalt:
-        halt = BudgetHalt(
+    company_usd = _actual_usd(session, company_id)
+    if company_usd > app_config.budget.max_usd_per_company:
+        write_halt(
+            session,
             company_id=company_id,
-            scope=scope,
-            limit_name=limit_name,
-            limit_value=limit_value,
-            observed_value=observed_value,
-            period_key=period_key,
-            reason=reason,
-            created_at=utcnow(),
+            scope=BudgetScope.COMPANY,
+            limit_name="max_usd_per_company",
+            limit_value=app_config.budget.max_usd_per_company,
+            observed_value=company_usd,
+            period_key=None,
+            reason=(
+                "Worst-case pricing of a run orphaned by an interrupted process "
+                f"brings lifetime spend to ${company_usd:.4f}, over the "
+                f"${app_config.budget.max_usd_per_company:.2f} lifetime ceiling."
+            ),
         )
-        session.add(halt)
-        session.commit()
-        return halt

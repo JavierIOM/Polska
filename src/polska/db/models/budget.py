@@ -40,7 +40,7 @@ class BudgetHalt(Base):
     scope: Mapped[BudgetScope] = mapped_column(
         Enum(BudgetScope, native_enum=False, length=32, validate_strings=True)
     )
-    #: Which ceiling, e.g. "max_tokens_per_day".
+    #: Which ceiling, e.g. "max_usd_per_day".
     limit_name: Mapped[str] = mapped_column(String(80))
     limit_value: Mapped[float] = mapped_column(Float)
     observed_value: Mapped[float] = mapped_column(Float)
