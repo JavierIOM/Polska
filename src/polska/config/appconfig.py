@@ -31,7 +31,14 @@ class SchedulerConfig(BaseModel):
 
 
 class LimitsConfig(BaseModel):
-    """How much work may be in flight."""
+    """How much work may be in flight, and how a failed task earns another go.
+
+    A retry's delay is wall-clock, measured from the task's own last transition
+    (``Task.updated_at``), not a count of scheduler ticks: it does not need the
+    orchestrator to track its own tick number, and it degrades sensibly if
+    ``scheduler.interval_hours`` changes later. ``delay = min(retry_base_delay_seconds
+    * retry_backoff_multiplier ** (attempts - 1), retry_max_delay_seconds)``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -40,8 +47,23 @@ class LimitsConfig(BaseModel):
     #: Ceiling on what one planning cycle may enqueue, before dedup.
     max_tasks_per_tick: int = Field(default=5, ge=1)
     #: A task that has failed this many times is abandoned rather than requeued.
+    #: See also budget.max_usd_per_task: a task can also be abandoned for cost
+    #: before it ever reaches this many attempts.
     max_attempts: int = Field(default=3, ge=1)
     task_timeout_seconds: int = Field(default=900, ge=30)
+
+    retry_base_delay_seconds: int = Field(default=900, ge=0)
+    retry_backoff_multiplier: float = Field(default=2.0, ge=1.0)
+    retry_max_delay_seconds: int = Field(default=14_400, ge=0)
+
+    @model_validator(mode="after")
+    def _retry_bounds_are_ordered(self) -> Self:
+        if self.retry_base_delay_seconds > self.retry_max_delay_seconds:
+            raise ValueError(
+                "retry_base_delay_seconds is above retry_max_delay_seconds, so the "
+                "very first retry would already be clamped to less than its own base."
+            )
+        return self
 
 
 class BudgetConfig(BaseModel):
@@ -65,28 +87,42 @@ class BudgetConfig(BaseModel):
     CLI stops itself mid-run, and reserved in full against the day and company
     ledgers before the run starts, since that reservation, not a token estimate, is
     what the SDK is contracted to hold the run to.
+
+    ``max_usd_per_task`` exists because ``limits.max_attempts`` bounds *retries*, not
+    *spend*: on an expensive model, a task that uses every attempt can cost
+    ``max_attempts x max_usd_per_run``, which can be most of a day's budget for one
+    broken task. Checked against that task's own cumulative ``Run.cost_usd``,
+    independently of how many attempts it has used, so a task is abandoned for cost
+    even if it still has attempts left.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     max_tokens_per_run: int = Field(default=200_000, ge=1)
     max_usd_per_run: float = Field(default=3.0, gt=0)
+    max_usd_per_task: float = Field(default=6.0, gt=0)
     max_usd_per_day: float = Field(default=10.0, gt=0)
     max_usd_per_company: float = Field(default=250.0, gt=0)
     #: Frozen into each run row so a later rate change cannot rewrite old costs.
     usd_to_gbp: float = Field(default=0.79, gt=0)
 
     @model_validator(mode="after")
-    def _run_within_day_within_company(self) -> Self:
+    def _run_within_task_within_day_within_company(self) -> Self:
         if self.max_usd_per_day > self.max_usd_per_company:
             raise ValueError(
                 "max_usd_per_day is above max_usd_per_company, so the lifetime "
                 "ceiling would be hit inside a single day and the daily one could "
                 "never fire."
             )
-        if self.max_usd_per_run > self.max_usd_per_day:
+        if self.max_usd_per_task > self.max_usd_per_day:
             raise ValueError(
-                "max_usd_per_run is above max_usd_per_day. One run would exhaust the day."
+                "max_usd_per_task is above max_usd_per_day. One task retrying within "
+                "a single day could exhaust the day on its own."
+            )
+        if self.max_usd_per_run > self.max_usd_per_task:
+            raise ValueError(
+                "max_usd_per_run is above max_usd_per_task, so a task could never "
+                "complete even a single attempt without tripping its own cost ceiling."
             )
         return self
 

@@ -44,7 +44,7 @@ from sqlalchemy.orm import Session
 
 from polska.activity import log
 from polska.adapters.registry import AdapterRegistry
-from polska.budget import BudgetExceeded, BudgetGuard
+from polska.budget import BudgetExceeded, BudgetGuard, actual_usd_for_task
 from polska.config.appconfig import AppConfig
 from polska.config.company import CompanyProfile
 from polska.db.enums import ActivityKind, AgentName, RunStatus, TaskState
@@ -255,7 +255,8 @@ class AgentRunner:
 
     def _fail_or_abandon(self, session: Session, task: Task, reason: str) -> None:
         """Move a task out of ``running`` after a failure, to ``failed`` if it may
-        still be retried, or to ``abandoned`` if this was its last attempt.
+        still be retried, or to ``abandoned`` if it has run out of either attempts
+        or budget.
 
         Without this, a task that exhausts ``limits.max_attempts`` would sit in
         ``failed`` forever, and ``failed`` suppresses a fresh planner proposal for
@@ -265,26 +266,44 @@ class AgentRunner:
         the dedup rules never suppress, or the underlying need goes quiet with
         nothing left that will ever try it again.
 
+        Two independent reasons can exhaust a task, checked separately because they
+        measure different things: ``limits.max_attempts`` bounds retries, and
+        ``budget.max_usd_per_task`` bounds spend. A task can hit the cost ceiling
+        with attempts still available, on an expensive model, and it must not be
+        allowed one more attempt just because the attempt counter has room left.
+
         ``failed`` itself is not requeued here: whether and when to retry a failed
-        task is a scheduling decision (capacity, budget, backoff) that belongs to
-        the orchestrator's loop, not to one invocation of the runner.
+        task is a scheduling decision (capacity, backoff) that belongs to the
+        orchestrator's loop, not to one invocation of the runner.
         """
-        exhausted = task.attempts >= self._config.limits.max_attempts
-        if exhausted:
+        attempts_exhausted = task.attempts >= self._config.limits.max_attempts
+        spent = actual_usd_for_task(session, task.id)
+        budget_exhausted = spent >= self._config.budget.max_usd_per_task
+
+        if attempts_exhausted or budget_exhausted:
+            why = (
+                f"attempts ({task.attempts}/{self._config.limits.max_attempts})"
+                if attempts_exhausted
+                else f"cost (${spent:.4f}/${self._config.budget.max_usd_per_task:.2f})"
+            )
             task.transition_to(
                 TaskState.ABANDONED,
                 result={
                     "abandoned_reason": reason,
+                    "abandoned_because": why,
                     "attempts": task.attempts,
                     "max_attempts": self._config.limits.max_attempts,
+                    "spent_usd": spent,
+                    "max_usd_per_task": self._config.budget.max_usd_per_task,
                 },
             )
-            summary = f"Abandoned after {task.attempts} attempt(s): {reason}"
+            summary = f"Abandoned, exhausted {why}: {reason}"
             kind = ActivityKind.TASK_STATE_CHANGED
         else:
             task.transition_to(TaskState.FAILED, error=reason)
             summary = (
-                f"Failed (attempt {task.attempts}/{self._config.limits.max_attempts}): {reason}"
+                f"Failed (attempt {task.attempts}/{self._config.limits.max_attempts}, "
+                f"${spent:.4f}/${self._config.budget.max_usd_per_task:.2f} spent): {reason}"
             )
             kind = ActivityKind.TASK_STATE_CHANGED
         session.commit()

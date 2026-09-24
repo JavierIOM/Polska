@@ -55,6 +55,10 @@ class RunStatus(StrEnum):
     #: process start by reconcile_orphaned_runs, which prices it at the worst case
     #: (its reservation) rather than assuming zero.
     ORPHANED = "orphaned"
+    #: An ORPHANED run whose cost has since been confirmed by a human and corrected
+    #: from the worst-case estimate to a real figure (or to zero, if it never
+    #: actually billed). Never reached automatically: see write_off_orphan.
+    RECONCILED = "reconciled"
     INVALID_OUTPUT = "invalid_output"
 
 
@@ -102,5 +106,6 @@ class ActivityKind(StrEnum):
     APPROVAL_DECIDED = "approval_decided"
     BUDGET_HALT = "budget_halt"
     BUDGET_RESUMED = "budget_resumed"
+    ORPHAN_WRITTEN_OFF = "orphan_written_off"
     SCHEDULER_TICK = "scheduler_tick"
     ERROR = "error"

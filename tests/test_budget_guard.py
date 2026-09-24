@@ -352,3 +352,109 @@ async def test_a_reservation_is_blocked_after_orphan_recovery_trips_a_halt(
     guard = BudgetGuard(tight_config)
     with pytest.raises(BudgetExceeded):
         await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+
+
+# ------------------------------------------------------------------------- write-off
+
+
+def test_writing_off_an_orphan_corrects_its_cost_and_marks_it_reconciled(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    from polska.budget import write_off_orphan
+
+    orphan = _run(session, company, status=RunStatus.ORPHANED, cost_usd=1.0, fx_rate=0.79)
+
+    written_off = write_off_orphan(
+        session, orphan, actual_cost_usd=0.02, decided_by="javier", note="checked the console"
+    )
+
+    assert written_off.status == RunStatus.RECONCILED
+    assert written_off.cost_usd == 0.02
+    assert written_off.cost_gbp == pytest.approx(0.02 * 0.79)
+
+
+def test_writing_off_an_orphan_leaves_an_audit_trail(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    from sqlalchemy import select
+
+    from polska.budget import write_off_orphan
+    from polska.db.enums import ActivityKind
+    from polska.db.models import ActivityEvent
+
+    orphan = _run(session, company, status=RunStatus.ORPHANED, cost_usd=1.0)
+    write_off_orphan(session, orphan, actual_cost_usd=0.0, decided_by="javier", note="never billed")
+
+    event = session.execute(
+        select(ActivityEvent).where(ActivityEvent.kind == ActivityKind.ORPHAN_WRITTEN_OFF)
+    ).scalar_one()
+    assert event.detail["previous_cost_usd"] == 1.0
+    assert event.detail["actual_cost_usd"] == 0.0
+    assert event.detail["decided_by"] == "javier"
+    assert event.detail["note"] == "never billed"
+
+
+def test_writing_off_a_non_orphan_is_refused(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    from polska.budget import write_off_orphan
+
+    run = _run(session, company, status=RunStatus.SUCCEEDED, cost_usd=0.5)
+    with pytest.raises(ValueError, match="not orphaned"):
+        write_off_orphan(session, run, actual_cost_usd=0.0, decided_by="javier")
+
+
+def test_a_write_off_does_not_auto_clear_a_halt_it_caused(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    """Correcting the ledger downward is not, by itself, permission to resume."""
+    from polska.budget import write_off_orphan
+
+    for _ in range(3):
+        _run(session, company, status=RunStatus.RUNNING, cost_usd=0.0, tokens=0)
+    orphans = reconcile_orphaned_runs(session, tight_config)
+    assert active_halt(session, company.id) is not None
+
+    for orphan in orphans:
+        write_off_orphan(session, orphan, actual_cost_usd=0.0, decided_by="javier")
+
+    # Ledger is now clean, but the halt is still open: clearing it stays a
+    # separate, deliberate act.
+    assert active_halt(session, company.id) is not None
+
+
+# ------------------------------------------------------------------------ task cost
+
+
+def test_actual_usd_for_task_sums_across_every_run_the_task_has_had(
+    session: Session, company: Company
+) -> None:
+    from polska.budget import actual_usd_for_task
+    from polska.db.enums import GoalStatus, TaskType
+    from polska.db.models import Goal, Task
+
+    goal = Goal(
+        company_id=company.id,
+        title="Test goal",
+        metric="x",
+        target_value=1,
+        status=GoalStatus.ACTIVE,
+    )
+    session.add(goal)
+    session.flush()
+    task = Task(company_id=company.id, goal_id=goal.id, type=TaskType.RESEARCH, title="A task")
+    session.add(task)
+    session.flush()
+
+    for cost in (0.5, 1.25):
+        run = _run(session, company, cost_usd=cost)
+        run.task_id = task.id
+    session.commit()
+
+    assert actual_usd_for_task(session, task.id) == pytest.approx(1.75)
+
+
+def test_actual_usd_for_task_is_zero_for_a_task_with_no_runs(session: Session) -> None:
+    from polska.budget import actual_usd_for_task
+
+    assert actual_usd_for_task(session, 999) == 0.0

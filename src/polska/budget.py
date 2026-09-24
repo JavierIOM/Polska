@@ -93,6 +93,19 @@ def _actual_usd(session: Session, company_id: int, *, since_day: str | None = No
     return float(session.execute(stmt).scalar_one())
 
 
+def actual_usd_for_task(session: Session, task_id: int) -> float:
+    """Real dollar spend across every run a single task has had.
+
+    Queried directly rather than through ``Task.runs``: the session may already
+    have that relationship loaded from earlier in the same request, and with
+    ``expire_on_commit=False`` a freshly committed run is not guaranteed to appear
+    in an already-cached collection. A direct query is never stale.
+    """
+    total_expr = func.coalesce(func.sum(Run.cost_usd), 0.0)
+    stmt = select(total_expr).where(Run.task_id == task_id)
+    return float(session.execute(stmt).scalar_one())
+
+
 def active_halt(session: Session, company_id: int) -> BudgetHalt | None:
     """The uncleared halt blocking this company, if there is one.
 
@@ -385,3 +398,64 @@ def _log_orphan_recovery(session: Session, app_config: AppConfig, company_id: in
                 f"${app_config.budget.max_usd_per_company:.2f} lifetime ceiling."
             ),
         )
+
+
+def write_off_orphan(
+    session: Session,
+    run: Run,
+    *,
+    actual_cost_usd: float,
+    decided_by: str,
+    note: str = "",
+) -> Run:
+    """Correct an ORPHANED run's worst-case pricing to a confirmed real figure.
+
+    Nothing in this system can learn a crashed run's actual usage on its own: the
+    process that would have read the result is the one that died. This is the
+    deliberate human override for when that figure becomes known some other way (a
+    check against the Anthropic console, or a confirmation that the call never
+    actually reached the API and the real cost is zero). ``actual_cost_usd`` is
+    required, never defaulted, so every write-off is a stated decision, not a
+    guess.
+
+    Moves the run to RECONCILED rather than back to a spent-looking status, so a
+    query can always tell "still priced at worst case" apart from "a human has
+    confirmed this figure". Writes an ORPHAN_WRITTEN_OFF activity event recording
+    the old and new values, who decided it and why: that event is the audit trail,
+    there is no separate table for it.
+
+    Does **not** clear any BudgetHalt the original worst-case pricing may have
+    tripped. That stays a separate, deliberate act, the same as every other halt:
+    the ledger being corrected downward is not, by itself, permission to resume.
+    """
+    if run.status != RunStatus.ORPHANED:
+        raise ValueError(
+            f"Run {run.id} is {run.status}, not orphaned. write_off_orphan only "
+            "corrects the worst-case price reconcile_orphaned_runs assigned; it is "
+            "not a general way to edit a run's recorded cost."
+        )
+
+    previous_cost_usd = run.cost_usd
+    fx_rate = run.fx_rate or 1.0
+    run.status = RunStatus.RECONCILED
+    run.cost_usd = actual_cost_usd
+    run.cost_gbp = actual_cost_usd * fx_rate
+
+    log(
+        session,
+        company_id=run.company_id,
+        kind=ActivityKind.ORPHAN_WRITTEN_OFF,
+        summary=(
+            f"Run {run.id} written off: ${previous_cost_usd:.4f} worst-case "
+            f"corrected to ${actual_cost_usd:.4f}"
+        ),
+        detail={
+            "previous_cost_usd": previous_cost_usd,
+            "actual_cost_usd": actual_cost_usd,
+            "decided_by": decided_by,
+            "note": note,
+        },
+        run_id=run.id,
+    )
+    session.commit()
+    return run

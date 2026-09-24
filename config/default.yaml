@@ -15,8 +15,17 @@ limits:
   max_concurrent_tasks: 2
   max_tasks_per_day: 12
   max_tasks_per_tick: 5
+  # A task failing this many times is abandoned rather than requeued. It can
+  # also be abandoned sooner than this on cost: see budget.max_usd_per_task.
   max_attempts: 3
   task_timeout_seconds: 900
+  # Wall-clock backoff before a failed task is eligible for another attempt,
+  # measured from the task's own last transition, not a count of ticks:
+  # min(retry_base_delay_seconds * retry_backoff_multiplier ** (attempts - 1),
+  # retry_max_delay_seconds). 15 minutes, then 30, capped at one tick (4h).
+  retry_base_delay_seconds: 900
+  retry_backoff_multiplier: 2.0
+  retry_max_delay_seconds: 14400
 
 budget:
   # Hard stops. Crossing one halts the scheduler and writes a BudgetHalt row.
@@ -28,6 +37,10 @@ budget:
   # same-model, single-run output-size safety net, never used to price anything.
   max_tokens_per_run: 200000
   max_usd_per_run: 3.0
+  # limits.max_attempts bounds retries, not spend. On Opus, max_attempts alone
+  # could let one broken task cost most of a day's budget. This catches that
+  # independently of how many attempts it has used.
+  max_usd_per_task: 6.0
   max_usd_per_day: 10.0
   max_usd_per_company: 250.0
   # Frozen into each run at write time so a rate change never rewrites history.

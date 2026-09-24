@@ -68,9 +68,17 @@ def test_a_daily_ceiling_above_the_lifetime_one_is_refused() -> None:
         BudgetConfig(max_usd_per_day=100, max_usd_per_company=50)
 
 
-def test_a_run_ceiling_above_the_daily_one_is_refused() -> None:
+def test_a_task_ceiling_above_the_daily_one_is_refused() -> None:
     with pytest.raises(ValidationError, match="exhaust the day"):
-        BudgetConfig(max_usd_per_run=20.0, max_usd_per_day=10.0)
+        BudgetConfig(max_usd_per_task=20.0, max_usd_per_day=10.0)
+
+
+def test_a_run_ceiling_above_the_task_one_is_refused() -> None:
+    """max_attempts bounds retries, not spend: max_usd_per_task is the actual per-
+    task cost ceiling, and a run reservation above it would mean a task could never
+    even complete a single attempt."""
+    with pytest.raises(ValidationError, match="never complete even a single attempt"):
+        BudgetConfig(max_usd_per_run=20.0, max_usd_per_task=6.0)
 
 
 def test_a_zero_fx_rate_is_refused() -> None:

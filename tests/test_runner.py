@@ -680,3 +680,54 @@ async def test_exhausting_retries_abandons_the_task_instead_of_leaving_it_failed
     assert task.state == TaskState.ABANDONED
     assert task.result["attempts"] == app_config.limits.max_attempts
     assert "still broken" in task.result["abandoned_reason"]
+
+
+async def test_exceeding_the_per_task_cost_ceiling_abandons_before_attempts_run_out(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """max_attempts bounds retries, not spend. A task that costs more than
+    max_usd_per_task must be abandoned even on its very first attempt, with
+    plenty of attempts still nominally available."""
+    tight = app_config.model_copy(
+        update={
+            "budget": app_config.budget.model_copy(
+                update={
+                    "max_usd_per_run": 0.001,
+                    "max_usd_per_task": 0.001,
+                    "max_usd_per_day": 1.0,
+                    "max_usd_per_company": 10.0,
+                }
+            )
+        }
+    )
+    guard = BudgetGuard(tight)
+    output = {"succeeded": False, "summary": "Nope.", "failure_reason": "too expensive"}
+    # Costs $0.0021, well over the $0.001 task ceiling, on a single attempt.
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=tight,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    assert tight.limits.max_attempts > 1  # plenty of attempts nominally left
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft something.",
+    )
+
+    session.refresh(task)
+    assert task.attempts == 1
+    assert task.attempts < tight.limits.max_attempts
+    assert task.state == TaskState.ABANDONED
+    assert "cost" in task.result["abandoned_because"]

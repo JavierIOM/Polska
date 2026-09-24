@@ -5,6 +5,41 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-24
+
+Two follow-ups from 0.2.1's review, still before phase 3 starts.
+
+### Added
+
+- `RunStatus.RECONCILED` and `polska.budget.write_off_orphan`: the manual correction
+  path for an `ORPHANED` run once its real cost becomes known some other way (a
+  check against the console, or a confirmation it never actually billed). Requires
+  a stated `actual_cost_usd`, never defaults to one, and never auto-clears any
+  `BudgetHalt` the original worst-case pricing tripped, that stays a separate
+  deliberate act. Writes an `ORPHAN_WRITTEN_OFF` activity event recording the old
+  and new figures, who decided it and why: that event is the audit trail. No
+  dashboard control for this exists yet; until phase 5 it is a direct call.
+- `BudgetConfig.max_usd_per_task` and `polska.budget.actual_usd_for_task`:
+  `limits.max_attempts` bounds retries, not spend, and on an expensive model one
+  broken task retrying to exhaustion could cost most of a day's budget.
+  `AgentRunner._fail_or_abandon` now abandons a task on either exhausted attempts
+  or exhausted per-task spend, whichever comes first, checked independently.
+- `LimitsConfig.retry_base_delay_seconds` / `retry_backoff_multiplier` /
+  `retry_max_delay_seconds`: the stated policy for phase 3's requeue logic, wall
+  clock against `Task.updated_at` rather than a tick count, so it doesn't need the
+  orchestrator to track its own tick number and degrades sensibly if
+  `scheduler.interval_hours` changes. Defaults: 15 minutes, doubling, capped at 4h.
+- 7 new tests: write-off correctness, its audit trail, refusing a non-orphan, a
+  halt surviving a write-off, `actual_usd_for_task` summing across a task's runs,
+  and a task abandoned on cost with attempts still nominally available. 192 tests
+  total.
+
+### Notes
+
+- The `$defs`/`$ref` live check remains unresolved: retried twice against a topped-up
+  account, still "Credit balance is too low" both times. Not a code problem; retry
+  again before the planner leans on structured output.
+
 ## [0.2.1] - 2026-09-24
 
 Three correctness fixes to phase 2 raised in review, before phase 3 starts.
