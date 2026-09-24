@@ -3,9 +3,10 @@
 An autonomous company operator. An orchestrator decides what a business needs next,
 then dispatches agents to do it on a schedule, without anyone driving each step.
 
-Phases 1 and 2 of 5 are built: schema, models, migrations, the agent runner, the
-dry-run adapter and cost accounting. Nothing has been run against a live Anthropic
-API key yet: every test runs against a fake SDK stream, by design (see Tests below).
+Phases 1 through 3 of 5 are built: schema, models, migrations, the agent runner,
+cost accounting, and the orchestrator loop and scheduler. Nothing has been run
+against a live Anthropic API key yet: every test runs against a fake SDK stream, by
+design (see Tests below).
 
 ## Build status
 
@@ -13,7 +14,7 @@ API key yet: every test runs against a fake SDK stream, by design (see Tests bel
 |-------|-------|-------|
 | 1 | Schema, models, migrations | Done |
 | 2 | Agent runner, dry-run adapter, cost accounting | Done |
-| 3 | Orchestrator loop and scheduler | Not started |
+| 3 | Orchestrator loop and scheduler | Done |
 | 4 | Approval gate | Partial: classification, dispatch and execution are done; the dashboard's approve/reject endpoints are not |
 | 5 | Dashboard | Not started |
 
@@ -30,10 +31,16 @@ waits for a human.
 the brand voice, the constraints and the connected integrations. The YAML is the
 source of truth; the database row is a snapshot with a hash so an edit on disk is
 noticed. The schema is multi-company from the start even though one profile ships.
+`sync_company` does the loading, at the start of every tick: descriptive fields
+refresh from the YAML every time, but once a goal exists, its `current_value` and
+`status` are database-owned, since they evolve from real tracked progress, not
+from re-reading a static file.
 
-**Goal** is a measurable target with a status. The target is a number and a unit,
-not an aspiration, because a goal the planner cannot measure is one it will argue
-with itself about forever.
+**Goal** is a measurable target with a status, and a stable `key` matching the
+profile's `GoalSpec.key`: that key is what a planner proposal's `goal_key` resolves
+against, since a goal's title is free text the profile can edit at any time. The
+target is a number and a unit, not an aspiration, because a goal the planner
+cannot measure is one it will argue with itself about forever.
 
 **Task** has a type (engineering, marketing, support, research), a goal it serves,
 a state machine and a result payload.
@@ -44,8 +51,8 @@ queued ──► running ──► done
    │          ├──► awaiting_approval ──► running ──► done
    │          │            └──► abandoned  (rejected)
    │          │
-   │          └──► failed ──► queued  (bounded retry)
-   │                  └──► abandoned
+   │          └──► failed ──► queued  (bounded retry, on a wall-clock backoff)
+   │                  └──► abandoned  (attempts or per-task budget exhausted)
    └──► abandoned
 ```
 
@@ -53,6 +60,13 @@ queued ──► running ──► done
 task moving from `running` to `running` is a double-dispatch bug, and silence
 would hide it. Nothing assigns to `Task.state` directly; everything goes through
 `transition_to()`, which raises `IllegalTransition` on an illegal move.
+
+A `failed` task is only requeued once its backoff has elapsed
+(`retry_delay_seconds`, doubling from `limits.retry_base_delay_seconds`, capped at
+`retry_max_delay_seconds`, measured from `Task.updated_at`), and only if it has
+exhausted neither `limits.max_attempts` nor `budget.max_usd_per_task` — the two are
+checked independently, because on an expensive model a broken task can exhaust its
+budget with attempts still nominally available.
 
 **Run** is one agent invocation against one task: the prompt, the model, the tokens,
 the cost, the duration, the tools called and the raw output. Cost is stored in USD
@@ -73,6 +87,22 @@ deliberate human act.
 in one indexed query. It is also where "log before you act" lands: an external effect
 writes `action_proposed` before the adapter is called and `action_executed` after, so
 a crash mid-call still leaves evidence.
+
+**A tick** (`run_company_tick`) is one company's cycle: sync, plan, dedup, enqueue,
+requeue, dispatch. Two things worth knowing before touching it:
+
+- **Enqueue caps apply in a fixed order.** The planner's proposals are sorted by
+  priority and capped at `limits.max_tasks_per_tick` *before* dedup runs (dedup
+  scores what survives the cap, not the raw planner output), and only after that
+  does `limits.max_tasks_per_day` gate actual creation, since several ticks can fall
+  in one day.
+- **Dispatch uses a different session per task, deliberately.** Planning is
+  sequential and stays on one session for the whole phase; dispatch runs up to
+  `limits.max_concurrent_tasks` tasks *concurrently*, and a synchronous SQLAlchemy
+  `Session` is not safe to share across concurrent callers. Each dispatched task
+  gets its own session, opened fresh and closed with that task's run. The shared
+  `AgentRunner` (and the `BudgetGuard` inside it) is safe to reuse across those
+  calls, since its own state is guarded by an `asyncio.Lock`.
 
 ## Design rules
 
@@ -100,13 +130,21 @@ These are not negotiable and the tests enforce several of them.
 - **A crash mid-run is not zero spend.** Every run is written to the database in
   `running` state *before* the SDK is ever called, and updated in place once it
   finishes. If the process dies in between, that row is left behind rather than
-  silently missing, and `reconcile_orphaned_runs` — which **must run once at process
-  start, before phase 3's scheduler takes its first tick** — prices it at its
+  silently missing, and `reconcile_orphaned_runs` — which **`main.py` runs once at
+  process start, before the scheduler's first tick** — prices it at its
   reservation's worst case, not zero, and re-checks the ceilings against that worse
   number immediately. Nothing corrects that figure automatically, because nothing in
   this system can learn a crashed run's real usage on its own; `write_off_orphan` is
   the deliberate human override once the real figure is known some other way, always
   with a stated cost and an audit trail, and it never auto-clears a halt it caused.
+- **Dedup is state-based, not a time window alone.** `FAILED`/`QUEUED`/`RUNNING`/
+  `AWAITING_APPROVAL` suppress a fresh planner proposal unconditionally,
+  `DONE` suppresses only inside `dedup.lookback_days`, and `ABANDONED` never
+  suppresses at any age: it is the one state that means the system tried and gave
+  up, and the underlying need is still open. The scoring itself is deterministic
+  (`rapidfuzz` token-set ratio) with an LLM tiebreak batched through the dedup
+  judge for whatever falls in the ambiguous band; a judge call that fails or gives
+  no usable verdict defaults to kept, never dropped.
 - **Every agent names its model and its tool allowlist explicitly.** Nothing is
   inherited. An empty list means the agent reasons but touches nothing.
 - **Reversible actions run immediately; irreversible ones never do.** They write a
@@ -162,6 +200,10 @@ src/polska/
   gate.py                Classifies and dispatches proposed actions.
   prompts.py             Per-agent system prompt templates.
   runner.py              One agent invocation against the SDK, fully accounted for.
+  sync.py                Loads a company profile's goals into the database.
+  dedup.py               Deterministic fuzzy match plus the judge tiebreak.
+  orchestrator.py        One company's tick: plan, dedup, enqueue, requeue, dispatch.
+  main.py                The process entrypoint: startup recovery, then the scheduler.
 tests/
 ```
 
@@ -188,9 +230,21 @@ python3.12 -m venv .venv
 Copy `.env.example` to `.env` before running against a live key. Nothing in the test
 suite needs one: every SDK call in it goes through a fake `query_fn`, never the network.
 
+To actually run the orchestrator against a live key: put `ANTHROPIC_API_KEY` in
+`.env`, add a company profile under `companies/`, then
+
+```
+.venv\Scripts\python.exe -m polska.main
+```
+
+This does not run migrations itself; run `alembic upgrade head` first, same as any
+deployment. It recovers any orphaned run from a previous crash, then starts one
+`AsyncIOScheduler` job on `scheduler.interval_hours` that reloads every company
+profile from disk on each firing and ticks each active one in turn.
+
 ## Tests
 
-192 tests, no network, about six seconds.
+226 tests, no network, about eight seconds.
 
 The state machine is tested exhaustively rather than by example: all 36 ordered pairs
 of states are asserted legal or illegal against a table written independently of the
@@ -226,18 +280,41 @@ second one behind; that a task exhausting its retries becomes `abandoned`, not l
 in `failed` forever; and that a task can be abandoned on cost alone, with attempts
 still nominally available.
 
+`test_sync.py` covers the profile-into-database sync: creation, that descriptive
+fields refresh from an edited YAML while `current_value` and a manually-set `status`
+survive it, and that a second goal added to an existing profile is created alongside
+the first rather than replacing it.
+
+`test_dedup.py` proves the state rules against the *matching* code, not just the
+state sets themselves: an identical `QUEUED` task suppresses, a `FAILED` one
+suppresses however old, a `DONE` one suppresses only inside the lookback window and
+stops once outside it, and an `ABANDONED` one never suppresses however identical
+and recent. Separately covers the judge path: marking an ambiguous proposal a
+duplicate or novel, and defaulting to kept when the judge is disabled or returns
+nothing usable.
+
+`test_orchestrator.py` covers the backoff formula in isolation, then a full tick end
+to end against a scripted fake runner: an empty plan enqueues nothing, a proposal
+resolves against the right goal, an inactive company is skipped entirely (and that
+skip is itself logged, which is what caught the commit bug below), dispatch respects
+`max_concurrent_tasks` and leaves the rest `queued`, a `FAILED` task past its backoff
+is requeued and redispatched, and a fatal `CLIConnectionError` from one dispatch
+propagates only once every other dispatch that tick has been accounted for.
+`test_main.py` covers the same error isolation one level up: a malformed profile, or
+one company's tick raising, does not stop the others from running.
+
 `test_migrations.py` builds a database by running every migration and compares tables,
 columns, indexes and foreign keys against the models. The rest of the suite uses
 `create_all` for speed, which is only safe while that test passes.
 
-**None of this has been run against a live Anthropic key**, and three attempts across
-two sessions were blocked, not completed: a one-off script mirroring the runner's
+**None of this has been run against a live Anthropic key**, and five attempts across
+three sessions were blocked, not completed: a one-off script mirroring the runner's
 real request (a Pydantic schema with nested models, `$defs`/`$ref`, sent as
 `output_format` to `claude-haiku-4-5`) got as far as a real `ResultMessage` coming
 back — confirming the `ResultError`-after-a-yielded-result code path fires exactly as
 `runner.py` expects — before failing on "Credit balance is too low" every time. The
 schema mechanics are unverified, not broken; check this again once the account has
-credit, before phase 3 leans on it. The script is
+credit, before leaning on it further. The script is
 `smoke_test_json_schema.py` in the scratchpad, not part of the repo.
 
 ## Conventions

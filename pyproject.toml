@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "polska"
-version = "0.2.2"
+version = "0.3.0"
 description = "Autonomous company operator: an orchestrator that plans work and dispatches agents on a schedule."
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
@@ -20,18 +20,22 @@ dependencies = [
     # happens, not an optional extra. It shells out to the Claude Code CLI, which the
     # package bundles, so the Docker image needs no separate Node/CLI install.
     "claude-agent-sdk>=0.2.159",
+    # The orchestrator's dedup pass imports this directly for the deterministic
+    # fuzzy-match half of the dedup design.
+    "rapidfuzz>=3.10.0",
+    # The scheduler imports this directly from phase 3 onwards.
+    "apscheduler>=3.11.0",
 ]
 
 [project.optional-dependencies]
-# Phase 3 onwards. Listed now so the shape of the final install is visible.
+# Phase 5 onwards (the dashboard). Listed now so the shape of the final install is
+# visible.
 runtime = [
-    "apscheduler>=3.11.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
     "jinja2>=3.1.4",
     "itsdangerous>=2.2.0",
     "argon2-cffi>=23.1.0",
-    "rapidfuzz>=3.10.0",
 ]
 dev = [
     "pytest>=8.3.0",

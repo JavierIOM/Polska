@@ -20,7 +20,13 @@ from polska.db.base import Base, make_engine
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers defaults to True, which silently disables every
+    # logger not named in alembic.ini's [loggers] section -- including every
+    # polska.* logger -- for the rest of the process. Harmless when alembic runs
+    # as its own CLI invocation, but this module is also imported by
+    # test_migrations.py, and a disabled logger stays disabled for the rest of
+    # that pytest session, well past this one test.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

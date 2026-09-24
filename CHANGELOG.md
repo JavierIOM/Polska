@@ -5,6 +5,83 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-24
+
+Phase 3 of 5: orchestrator loop and scheduler.
+
+### Added
+
+- `Goal.key`: the stable identifier a company profile's `GoalSpec.key` needs to
+  resolve against, unique per company. Missing from the phase 1 schema; a planner
+  proposal's `goal_key` had nothing to match against without it. Migration
+  `3ef3f8649043`.
+- `polska/sync.py`: `sync_company` creates or updates a `Company` and its `Goal`
+  rows from a loaded profile. Descriptive fields (title, description, metric,
+  target, unit, priority) refresh from the YAML on every sync; `current_value` and
+  `status` are database-owned once a goal exists, so a static file re-read can
+  never silently undo tracked progress or a deliberate pause. Called at the start
+  of every tick, which is cheap and means an edited profile takes effect without a
+  restart.
+- `polska/dedup.py`: the deterministic-fuzzy-match-plus-judge design from review,
+  wired up. A normalised composite key scored with `rapidfuzz`'s token-set ratio
+  against every comparison candidate; at or above `dedup.high_threshold` a proposal
+  is dropped as a duplicate, at or below `dedup.low_threshold` it is kept as novel,
+  and only the band between costs one batched call to the dedup judge agent for
+  the whole tick. The comparison set is state-based per the 0.1.1 fix:
+  `FAILED`/`QUEUED`/`RUNNING`/`AWAITING_APPROVAL` suppress unconditionally, `DONE`
+  only inside the lookback window, `ABANDONED` never. A judge call that fails or
+  returns no usable verdict defaults to kept, never dropped: silently losing a
+  genuine need is worse than an occasional repeat.
+- `polska/orchestrator.py`: `run_company_tick` runs one company's full cycle:
+  sync, plan (via the planner agent), dedup, enqueue (capped by
+  `limits.max_tasks_per_tick` before dedup and `limits.max_tasks_per_day` after),
+  requeue any `FAILED` task whose backoff has elapsed, then dispatch as many
+  `QUEUED` tasks as `limits.max_concurrent_tasks` allows. Dispatch runs
+  concurrently: each dispatched task gets its own freshly opened `Session` rather
+  than sharing the planning phase's session, since a synchronous `Session` is not
+  safe to use from multiple concurrent callers, while the shared `AgentRunner` (and
+  the `BudgetGuard` inside it) is, guarded by its own `asyncio.Lock`. A fatal,
+  non-per-task exception from one dispatch (e.g. `CLIConnectionError`) is not lost
+  among the others: every dispatch this tick is accounted for before it propagates.
+- `retry_delay_seconds` / `is_retry_eligible`: the wall-clock backoff policy stated
+  before this was built (`limits.retry_base_delay_seconds`, doubling by
+  `retry_backoff_multiplier`, capped at `retry_max_delay_seconds`), measured from
+  `Task.updated_at`, not a tick count.
+- `run_startup_recovery`: calls `reconcile_orphaned_runs` once. Must run before the
+  scheduler's first tick; `main.py` calls it first thing.
+- `polska/main.py`: the process entrypoint. Loads config and settings once, builds
+  the shared `AgentRunner`/`BudgetGuard`/`AdapterRegistry`, recovers orphans, then
+  runs one `AsyncIOScheduler` job on `scheduler.interval_hours` that reloads every
+  company profile from disk on each firing (so an edited or newly added profile is
+  picked up without a restart) and ticks each active one in turn. One company's
+  profile failing to load, or its tick raising, does not stop the others. Does not
+  run migrations itself; `alembic upgrade head` stays a separate deployment step.
+- 33 new tests across `test_sync.py`, `test_dedup.py`, `test_orchestrator.py` and
+  `test_main.py`. 226 tests total.
+
+### Fixed
+
+- `migrations/env.py`'s `fileConfig()` call defaulted `disable_existing_loggers` to
+  its own default of `True`, which silently disabled every logger not named in
+  `alembic.ini` — including every `polska.*` logger — for the rest of the process.
+  Harmless when Alembic runs as its own CLI invocation, but `test_migrations.py`
+  imports this same module, so running the full suite silently killed logging for
+  every test after it, caught by a `caplog`-based test that passed in isolation
+  and failed in the full run.
+- The inactive-company branch in `run_company_tick` logged an activity event but
+  never committed before returning, so the log line evaporated when the session
+  closed. Caught by the same kind of full-suite-vs-isolation discrepancy check.
+- `LimitsConfig.max_concurrent_tasks` now allows `0` (plan and enqueue every tick
+  without ever dispatching), distinct from `active=false` on the profile, which
+  skips the tick entirely.
+
+### Notes
+
+- The `$defs`/`$ref` live check remains unresolved: attempted twice more this
+  session, still "Credit balance is too low" both times. The planner still uses
+  the nested schema as designed; flattening it is deferred until there is actual
+  evidence it fails, per instruction not to work around an unconfirmed problem.
+
 ## [0.2.2] - 2026-09-24
 
 Two follow-ups from 0.2.1's review, still before phase 3 starts.

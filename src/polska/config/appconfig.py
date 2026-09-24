@@ -42,7 +42,9 @@ class LimitsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    max_concurrent_tasks: int = Field(default=2, ge=1)
+    #: 0 is legitimate: plan and enqueue every tick without ever dispatching, a
+    #: review-only mode distinct from `active=False`, which skips the tick entirely.
+    max_concurrent_tasks: int = Field(default=2, ge=0)
     max_tasks_per_day: int = Field(default=12, ge=1)
     #: Ceiling on what one planning cycle may enqueue, before dedup.
     max_tasks_per_tick: int = Field(default=5, ge=1)

@@ -76,6 +76,7 @@ def company(session: Session) -> Company:
 
     goal = Goal(
         company_id=record.id,
+        key="grow-the-list",
         title="Grow the list",
         metric="subscribers",
         target_value=500,

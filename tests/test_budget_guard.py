@@ -435,6 +435,7 @@ def test_actual_usd_for_task_sums_across_every_run_the_task_has_had(
 
     goal = Goal(
         company_id=company.id,
+        key="test-goal",
         title="Test goal",
         metric="x",
         target_value=1,

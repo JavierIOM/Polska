@@ -26,12 +26,21 @@ class Goal(Base):
     """
 
     __tablename__ = "goals"
-    __table_args__ = (Index("ix_goals_company_status", "company_id", "status"),)
+    __table_args__ = (
+        Index("ix_goals_company_status", "company_id", "status"),
+        Index("ix_goals_company_key", "company_id", "key", unique=True),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(
         ForeignKey("companies.id", ondelete="CASCADE"), index=True
     )
+
+    #: The stable identifier from the company profile's YAML (GoalSpec.key), unique
+    #: per company. This is what a planner proposal's ``goal_key`` resolves against;
+    #: nothing else in the database is stable enough to key a goal by, since the
+    #: title is free text the profile can edit at any time.
+    key: Mapped[str] = mapped_column(String(64))
 
     title: Mapped[str] = mapped_column(String(300))
     description: Mapped[str] = mapped_column(Text, default="")
