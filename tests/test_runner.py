@@ -1,0 +1,515 @@
+"""The agent runner, against a fake SDK rather than the network.
+
+``query_fn`` is dependency-injected specifically so these tests never import a real
+API key or spend a token: each one hands the runner a small async generator built
+from the real ``claude_agent_sdk`` message dataclasses, exactly as the actual SDK
+would yield them, and checks what the runner does with that stream.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+from claude_agent_sdk import (
+    AssistantMessage,
+    CLIConnectionError,
+    ResultError,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+from sqlalchemy import select
+
+from polska.adapters.registry import AdapterRegistry
+from polska.budget import BudgetGuard
+from polska.config.appconfig import AppConfig
+from polska.config.company import CompanyProfile
+from polska.db.enums import AgentName, ApprovalStatus, RunStatus, TaskState
+from polska.db.models import Approval, Company, Task
+from polska.runner import AgentRunner
+
+
+def _profile(**overrides: object) -> CompanyProfile:
+    base: dict[str, object] = {
+        "slug": "test-co",
+        "name": "Test Co",
+        "idea": "Selling things to people.",
+        "goals": [],
+    }
+    base.update(overrides)
+    return CompanyProfile.model_validate(base)
+
+
+def _result_message(
+    *,
+    is_error: bool = False,
+    structured_output: Any = None,
+    model_usage: dict[str, dict[str, Any]] | None = None,
+    result_text: str | None = None,
+) -> ResultMessage:
+    return ResultMessage(
+        subtype="success" if not is_error else "error_during_execution",
+        duration_ms=1234,
+        duration_api_ms=1000,
+        is_error=is_error,
+        num_turns=1,
+        session_id="sess-1",
+        structured_output=structured_output,
+        model_usage=model_usage,
+        result=result_text,
+    )
+
+
+def _fake_query(*messages: object):
+    """Builds a ``query_fn`` that replays a fixed sequence, ignoring its args."""
+
+    async def fake(*, prompt: str, options: object) -> AsyncIterator[object]:
+        for message in messages:
+            yield message
+
+    return fake
+
+
+def _fake_query_raising(exc: Exception, *messages: object):
+    """A ``query_fn`` that yields some messages, then raises, mirroring how
+    ``ResultError`` surfaces from the real SDK: often after a ResultMessage was
+    already yielded."""
+
+    async def fake(*, prompt: str, options: object) -> AsyncIterator[object]:
+        for message in messages:
+            yield message
+        raise exc
+
+    return fake
+
+
+@pytest.fixture
+def registry() -> AdapterRegistry:
+    return AdapterRegistry()
+
+
+@pytest.fixture
+def budget_guard(app_config: AppConfig) -> BudgetGuard:
+    return BudgetGuard(app_config)
+
+
+PLANNER_USAGE = {"claude-sonnet-5": {"inputTokens": 500, "outputTokens": 100, "costUSD": 0.0021}}
+
+
+# ------------------------------------------------------------------------- planner
+
+
+async def test_a_successful_planner_run_validates_and_writes_a_run_row(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    output = {"tasks": [], "no_action_reason": "Nothing new since last cycle."}
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(
+            AssistantMessage(content=[TextBlock(text="thinking...")], model="claude-sonnet-5"),
+            result_msg,
+        ),
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is not None
+    assert outcome.output.is_empty
+    assert outcome.run.status == RunStatus.SUCCEEDED
+    assert outcome.run.input_tokens == 500
+    assert outcome.run.output_tokens == 100
+    assert outcome.run.cost_usd == pytest.approx(0.0021)
+    assert outcome.run.agent == AgentName.PLANNER
+    assert outcome.run.session_id == "sess-1"
+
+
+async def test_missing_structured_output_is_invalid_output_not_a_crash(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    result_msg = _result_message(structured_output=None, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is None
+    assert outcome.run.status == RunStatus.INVALID_OUTPUT
+    assert "structured_output" in outcome.run.error
+
+
+async def test_structured_output_that_fails_schema_validation_is_invalid_output(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """The CLI honouring --json-schema is not the same guarantee as Pydantic
+    actually validating it. This proves the second check is load-bearing."""
+    bad_output = {"tasks": [], "no_action_reason": ""}  # empty plan with no reason
+    result_msg = _result_message(structured_output=bad_output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is None
+    assert outcome.run.status == RunStatus.INVALID_OUTPUT
+    # The Run row still records real usage: the model was called and tokens were
+    # spent even though the answer it gave was not usable.
+    assert outcome.run.input_tokens == 500
+
+
+async def test_a_cli_reported_error_result_is_recorded_as_failed(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    result_msg = _result_message(is_error=True, result_text="API Error: overloaded")
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is None
+    assert outcome.run.status == RunStatus.FAILED
+    assert "overloaded" in outcome.run.error
+
+
+async def test_a_result_error_exception_is_recorded_as_failed(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    exc = ResultError("hit max turns", data={"result": "ran out of turns"})
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query_raising(exc),
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is None
+    assert outcome.run.status == RunStatus.FAILED
+    assert "max turns" in outcome.run.error
+
+
+async def test_a_timeout_is_recorded_as_timed_out_not_failed(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    async def hangs(*, prompt: str, options: object):
+        import asyncio
+
+        await asyncio.sleep(10)
+        yield _result_message()  # pragma: no cover - never reached
+
+    config = app_config.model_copy(
+        update={
+            "agents": {
+                **app_config.agents,
+                AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
+                    update={"timeout_seconds": 1}
+                ),
+            }
+        }
+    )
+    runner = AgentRunner(
+        app_config=config, budget_guard=budget_guard, adapter_registry=registry, query_fn=hangs
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.run.status == RunStatus.TIMED_OUT
+
+
+async def test_a_cli_connection_error_is_recorded_then_reraised(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """This is not 'this task failed', it is 'the install is broken'. It must still
+    leave a record, but it must also propagate rather than be swallowed as if it
+    were an ordinary per-task failure."""
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query_raising(CLIConnectionError("cli not found")),
+    )
+
+    with pytest.raises(CLIConnectionError):
+        await runner.run_planner(
+            session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+        )
+
+    from polska.db.models import Run
+
+    run = session.execute(select(Run)).scalar_one()
+    assert run.status == RunStatus.FAILED
+
+
+# --------------------------------------------------------------------------- worker
+
+
+async def test_a_worker_with_no_actions_moves_the_task_to_done(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    output = {"succeeded": True, "summary": "Drafted the post.", "output": {"draft": "hello"}}
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft the launch post.",
+    )
+
+    session.refresh(task)
+    assert task.state == TaskState.DONE
+    assert task.result["summary"] == "Drafted the post."
+    assert task.attempts == 1
+
+
+async def test_a_worker_reporting_failure_moves_the_task_to_failed(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    output = {"succeeded": False, "summary": "Could not draft it.", "failure_reason": "no context"}
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft the launch post.",
+    )
+
+    session.refresh(task)
+    assert task.state == TaskState.FAILED
+    assert task.error == "no context"
+
+
+async def test_a_worker_proposing_an_irreversible_action_parks_the_task(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """The task must not be marked done while an action it depends on is still
+    sitting in the approval queue."""
+    output = {
+        "succeeded": True,
+        "summary": "Drafted and ready to send.",
+        "actions": [
+            {
+                "action_type": "email.send",
+                "adapter": "dry_run",
+                "payload": {"to": "someone@example.invalid"},
+                "preview": "To: someone@example.invalid",
+                "summary": "Send the drafted email.",
+            }
+        ],
+    }
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.SUPPORT,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Reply to the customer.",
+    )
+
+    session.refresh(task)
+    assert task.state == TaskState.AWAITING_APPROVAL
+    approval = session.execute(select(Approval)).scalar_one()
+    assert approval.status == ApprovalStatus.PENDING
+    assert approval.task_id == task.id
+
+
+async def test_an_invalid_worker_output_moves_the_task_to_failed(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    result_msg = _result_message(structured_output=None, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.ANALYST,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Research this.",
+    )
+
+    session.refresh(task)
+    assert task.state == TaskState.FAILED
+
+
+async def test_tool_use_is_recorded_with_its_error_flag(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    output = {"succeeded": True, "summary": "Looked into it.", "output": {}}
+    tool_call = ToolUseBlock(id="tu_1", name="Read", input={"file_path": "notes.md"})
+    tool_result = ToolResultBlock(tool_use_id="tu_1", content="file contents", is_error=False)
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(
+            AssistantMessage(content=[tool_call], model="claude-sonnet-5"),
+            UserMessage(content=[tool_result]),
+            result_msg,
+        ),
+    )
+
+    outcome = await runner.run_worker(
+        session,
+        agent_name=AgentName.ANALYST,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Research this.",
+    )
+
+    assert outcome.run.tools_called == [
+        {"id": "tu_1", "name": "Read", "input": {"file_path": "notes.md"}, "is_error": False}
+    ]
+
+
+# --------------------------------------------------------------------------- budget
+
+
+async def test_a_run_blocked_by_budget_never_calls_the_sdk(
+    session, app_config: AppConfig, registry: AdapterRegistry, company: Company, task: Task
+) -> None:
+    # A token ceiling can't be forced below max_tokens_per_run (config refuses that
+    # combination by construction), so the dollar ceiling is what is starved here:
+    # a fresh company with no prior spend still can't afford even one reservation
+    # against a near-zero daily dollar cap.
+    tight = app_config.model_copy(
+        update={"budget": app_config.budget.model_copy(update={"max_usd_per_day": 0.0000001})}
+    )
+    guard = BudgetGuard(tight)
+    calls: list[object] = []
+
+    def tracking_query(*, prompt: str, options: object):
+        calls.append(options)
+
+        async def gen():
+            yield _result_message()
+
+        return gen()
+
+    runner = AgentRunner(
+        app_config=tight, budget_guard=guard, adapter_registry=registry, query_fn=tracking_query
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft something.",
+    )
+
+    assert calls == []  # the SDK was never invoked
+    session.refresh(task)
+    assert task.state == TaskState.FAILED
+    assert task.error is not None and "ceiling" in task.error.lower()

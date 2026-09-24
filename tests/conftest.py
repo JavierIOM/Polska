@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 import polska.db.models  # noqa: F401  (registers the tables)
 from polska.config.appconfig import AppConfig, load_app_config
@@ -36,6 +36,13 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
     Base.metadata.create_all(eng)
     yield eng
     eng.dispose()
+
+
+@pytest.fixture
+def session_factory(engine: Engine) -> sessionmaker[Session]:
+    """The sessionmaker itself, for tests that need several independent sessions
+    against the same database, e.g. simulating concurrent dispatches."""
+    return make_session_factory(engine)
 
 
 @pytest.fixture

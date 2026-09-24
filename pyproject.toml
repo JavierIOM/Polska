@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "polska"
-version = "0.1.1"
+version = "0.2.0"
 description = "Autonomous company operator: an orchestrator that plans work and dispatches agents on a schedule."
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
@@ -16,12 +16,15 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "pyyaml>=6.0.2",
     "python-dotenv>=1.0.1",
+    # The runner imports this directly: it is how every agent invocation actually
+    # happens, not an optional extra. It shells out to the Claude Code CLI, which the
+    # package bundles, so the Docker image needs no separate Node/CLI install.
+    "claude-agent-sdk>=0.2.159",
 ]
 
 [project.optional-dependencies]
-# Phase 2 onwards. Listed now so the shape of the final install is visible.
+# Phase 3 onwards. Listed now so the shape of the final install is visible.
 runtime = [
-    "claude-agent-sdk>=0.1.0",
     "apscheduler>=3.11.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
@@ -45,6 +48,7 @@ packages = ["src/polska"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 filterwarnings = ["error::DeprecationWarning"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

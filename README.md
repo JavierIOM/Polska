@@ -3,17 +3,18 @@
 An autonomous company operator. An orchestrator decides what a business needs next,
 then dispatches agents to do it on a schedule, without anyone driving each step.
 
-Phase 1 of 5 is built: schema, models and migrations. Nothing runs against the
-Anthropic API yet.
+Phases 1 and 2 of 5 are built: schema, models, migrations, the agent runner, the
+dry-run adapter and cost accounting. Nothing has been run against a live Anthropic
+API key yet: every test runs against a fake SDK stream, by design (see Tests below).
 
 ## Build status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Schema, models, migrations | Done |
-| 2 | Agent runner, dry-run adapter, cost accounting | Not started |
+| 2 | Agent runner, dry-run adapter, cost accounting | Done |
 | 3 | Orchestrator loop and scheduler | Not started |
-| 4 | Approval gate | Partial: classification and records only |
+| 4 | Approval gate | Partial: classification, dispatch and execution are done; the dashboard's approve/reject endpoints are not |
 | 5 | Dashboard | Not started |
 
 ## The idea
@@ -87,19 +88,35 @@ These are not negotiable and the tests enforce several of them.
   adapter should read; they cannot contain the value. Approval payloads are stored in
   SQLite and rendered on the dashboard, so a credential-looking key in one is refused
   by the schema.
-- **A ceiling is a stop.** No soft mode, no degradation, no retry past a limit.
+- **A ceiling is a stop.** No soft mode, no degradation, no retry past a limit. Budget
+  is reserved before a run starts and released when it ends, not just summed from
+  `runs` after the fact: a reservation is what stops two concurrent dispatches from
+  both reading the same stale total and together crossing a ceiling neither would have
+  crossed alone.
 - **Every agent names its model and its tool allowlist explicitly.** Nothing is
   inherited. An empty list means the agent reasons but touches nothing.
+- **Reversible actions run immediately; irreversible ones never do.** They write a
+  full preview into `approvals` and stop, unless config explicitly auto-approves that
+  action type, in which case the row still exists and says so.
 
 ## Stack
 
-Python 3.12, SQLite in WAL mode, SQLAlchemy 2.0 with Alembic, Pydantic v2. Phase 2
-onwards adds the Claude Agent SDK, APScheduler, and FastAPI with plain HTML.
+Python 3.12, SQLite in WAL mode, SQLAlchemy 2.0 with Alembic, Pydantic v2, the Claude
+Agent SDK. Phase 3 onwards adds APScheduler and FastAPI with plain HTML.
 
 Note on the Agent SDK: it shells out to the Claude Code CLI, so the Docker image will
 need Node 20+ alongside Python. That is a fatter image than a plain Messages API loop
 would need, and it buys the tool harness, the permission modes and per-run usage
-reporting without writing them.
+reporting without writing them. The runner reads its exact API from the installed
+package rather than from training-time recall: several fields on `ClaudeAgentOptions`
+(`max_budget_usd`, `output_format`, `sandbox`, the `permission_mode` literals) did not
+exist as documented here, and the runner's cost accounting depends on getting the
+`ResultMessage.model_usage` key casing right, which was confirmed by reading the SDK's
+own source rather than guessed.
+
+Every worker agent runs with `permission_mode="bypassPermissions"`: this is an
+unattended scheduler with nobody present to answer an interactive tool-use prompt, so
+the per-agent tool allowlist is the security boundary, not a runtime confirmation.
 
 Concurrency is a single process: `AsyncIOScheduler` with an `asyncio.Semaphore` for
 the max-concurrent ceiling. Separate worker processes are the wrong call at this size.
@@ -115,6 +132,12 @@ src/polska/
   config/                Env settings, config schema, company profile loader.
   db/                    Engine, models, enums, the task state machine.
   schemas/               Pydantic contracts for every agent output.
+  adapters/              The adapter interface, the dry-run implementation, registry.
+  activity.py            The one place that writes to the activity feed.
+  budget.py              The budget guard: reserve before a run, release after.
+  gate.py                Classifies and dispatches proposed actions.
+  prompts.py             Per-agent system prompt templates.
+  runner.py              One agent invocation against the SDK, fully accounted for.
 tests/
 ```
 
@@ -138,22 +161,43 @@ python3.12 -m venv .venv
 .venv/bin/pytest
 ```
 
-Copy `.env.example` to `.env` before anything that talks to the API. Phase 1 needs no
-key: the schema, the config and the whole test suite run without one.
+Copy `.env.example` to `.env` before running against a live key. Nothing in the test
+suite needs one: every SDK call in it goes through a fake `query_fn`, never the network.
 
 ## Tests
 
-127 tests, no network, about two seconds.
+174 tests, no network, about six seconds.
 
 The state machine is tested exhaustively rather than by example: all 36 ordered pairs
 of states are asserted legal or illegal against a table written independently of the
-implementation, and a graph walk proves no state can trap a task forever. The approval
-gate has its own file covering classification, fail-closed behaviour, the
-credential-in-payload refusal and the record lifecycle.
+implementation, and a graph walk proves no state can trap a task forever. The dedup
+state sets (`DEDUP_SUPPRESSING_STATES`, `DEDUP_LOOKBACK_STATES`,
+`DEDUP_NEVER_SUPPRESSES`) have a test proving they partition every `TaskState` with no
+gaps and no overlap.
+
+The approval gate is split across two files: `test_approval_gate.py` covers
+classification, fail-closed behaviour, the credential-in-payload refusal and the
+record's own lifecycle; `test_gate_dispatch.py` covers the phase 2 half, actually
+calling an adapter, the `force_dry_run` interception, and auto-approve.
+`test_budget_guard.py` includes a real concurrency test: several reservations fired
+at once with `asyncio.gather`, asserting exactly as many are granted as fit under the
+ceiling and the rest are refused, not just that the arithmetic is right in isolation.
+`test_runner.py` builds fake SDK message streams from the real `claude_agent_sdk`
+dataclasses and checks the runner's handling of success, a schema-invalid result, the
+CLI's own error result, a `ResultError` exception, a wall-clock timeout, a
+budget-blocked run that never calls the SDK at all, and a `CLIConnectionError`
+propagating past a Run row rather than being swallowed as an ordinary task failure.
 
 `test_migrations.py` builds a database by running every migration and compares tables,
 columns, indexes and foreign keys against the models. The rest of the suite uses
 `create_all` for speed, which is only safe while that test passes.
+
+None of this has been run against a live Anthropic key. The fake `query_fn` is built
+from the SDK's real dataclasses and matches its documented behaviour as read from the
+installed package, but a schema built with nested Pydantic models (`$defs`/`$ref`) has
+not been confirmed to round-trip through the CLI's `--json-schema` flag against a real
+model. That is the first thing to check with a key in hand, before trusting this in
+production.
 
 ## Conventions
 

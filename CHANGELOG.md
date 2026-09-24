@@ -5,6 +5,78 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-24
+
+Phase 2 of 5: agent runner, dry-run adapter, cost accounting.
+
+### Added
+
+- `BudgetGuard` (`polska/budget.py`): reserves a run's full `max_tokens_per_run`
+  ceiling before it starts and releases it on completion, checked under an
+  `asyncio.Lock` against actual spend plus every other outstanding reservation.
+  Fixes the concurrency gap raised in review: two dispatches checking the same
+  ledger before either had written a Run row could together cross a ceiling
+  neither would have crossed alone. Also enforces daily and lifetime dollar
+  ceilings, and detects a run whose actual usage exceeded its own reservation.
+  An uncleared `BudgetHalt`, global or per-company, blocks every new reservation
+  regardless of current sums until a human clears it.
+- Adapter interface (`polska/adapters/`): `IntegrationAdapter`, `AdapterResult`, an
+  `AdapterRegistry`, and the one implementation phase 1 promised: `DryRunAdapter`,
+  which records what it would have done and performs nothing.
+- `polska/gate.py`: `dispatch_action` classifies a proposed action and either runs
+  it immediately (reversible), auto-approves and runs it (irreversible, listed in
+  config), or parks it pending (irreversible, not listed). `execute_approval`
+  replays a decided approval's stored payload exactly as written; it is the same
+  function an auto-approval calls now and the dashboard's approve button will call
+  in phase 4. `force_dry_run` substitutes the adapter actually called without
+  rewriting what was proposed, and marks the substitution in the execution record.
+- `polska/runner.py`: `AgentRunner` executes one call to the Claude Agent SDK's
+  `query()`, builds `ClaudeAgentOptions` from config (model, tool allowlist,
+  system prompt, a JSON Schema passed to the CLI's `--json-schema`), and writes a
+  `Run` row whatever happened. Cost prefers the SDK's own per-model `costUSD`,
+  falling back to this project's pricing table only when the SDK reported none.
+  `run_worker` owns a task's transition out of `queued` and into `done`,
+  `awaiting_approval` or `failed`, and dispatches any actions the agent proposed
+  through the gate. `query_fn` is dependency-injected so every test runs against a
+  fake SDK stream, never the network.
+- `polska/prompts.py`: one base system prompt per agent, folding in company brand
+  voice and constraints for every agent except the dedup judge, plus config's
+  `system_prompt_extra`.
+- `polska/activity.py`: the one function that writes to the activity feed.
+- 47 new tests: `test_budget_guard.py` (including a real `asyncio.gather`
+  concurrency test), `test_adapters.py`, `test_gate_dispatch.py`,
+  `test_runner.py`.
+- `DEDUP_SUPPRESSING_STATES`, `DEDUP_LOOKBACK_STATES`, `DEDUP_NEVER_SUPPRESSES` in
+  `polska.db.state`: see 0.1.1 below, folded in here as part of the same review pass.
+
+### Changed
+
+- `claude-agent-sdk` moved from a listed-but-unused `runtime` extra to a core
+  dependency: the runner imports it directly.
+- Agent model tiers retiered: see 0.1.1 below.
+
+### Notes for whoever picks this up with a live key
+
+- The SDK's exact surface (`ClaudeAgentOptions` fields, `ResultMessage` shape,
+  `ModelUsage` key casing) was confirmed by introspecting the installed
+  `claude-agent-sdk` 0.2.159 and reading its source, not recalled from training
+  data. Several fields (`max_budget_usd`, `output_format`, `sandbox`, the
+  `permission_mode` literal set) are newer than what a training-time guess would
+  have produced.
+- Every worker agent runs with `permission_mode="bypassPermissions"`: there is
+  nobody present to answer an interactive tool-use prompt in an unattended
+  scheduler, so the per-agent tool allowlist is the security boundary, not a
+  runtime confirmation.
+- Not yet confirmed against a live key: whether a Pydantic schema with nested
+  models (`$defs`/`$ref`) round-trips cleanly through the CLI's `--json-schema`
+  flag. Worth checking before phase 3 relies on it.
+- `sandbox`/network isolation for the engineer's workspace (the "no network"
+  half of the phase-1 decision) is not wired up. The primary control today is
+  that the engineer's tool allowlist grants no `WebSearch`/`WebFetch`; the SDK's
+  own `SandboxSettings.network` would add defence in depth but depends on OS
+  sandbox support (bubblewrap on Linux) being present in the deployment
+  container, which has not been verified against the target droplet.
+
 ## [0.1.1] - 2026-09-24
 
 Fixes to the phase 1 design raised in review, ahead of phase 2.
