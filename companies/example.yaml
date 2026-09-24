@@ -1,0 +1,96 @@
+# Company profile template.
+#
+# Copy this, rename it, and edit. Every .yaml in this directory is loaded on startup.
+# Validated by polska.config.company.CompanyProfile, so a malformed profile fails
+# loudly at load rather than confusing the planner at runtime.
+#
+# No credentials in here. Name the environment variable under 'secret_env' and the
+# adapter reads it at call time.
+
+slug: example-co
+name: Example Co
+active: true
+
+idea: >
+  A one-person shop selling laser-cut and 3D-printed homeware to the UK market,
+  direct through its own site and through Etsy. The operator has a day job, so
+  anything proposed has to be completable in an evening or handed to an agent
+  in full.
+
+brand_voice: >
+  Plain and direct. Short sentences. Dry where it fits, never salesy, never
+  exclamation marks. British English throughout. Talks about the making, the
+  materials and the constraints, not about passion or journeys.
+
+constraints:
+  - No paid advertising without explicit sign-off.
+  - Never claim a delivery date that has not been confirmed with the courier.
+  - Nothing is published under the operator's real name.
+  - Product photography must be of the actual item, never a render.
+  - Ship only within the UK and the Isle of Man for now.
+
+goals:
+  - key: newsletter
+    title: Grow the newsletter to 500 subscribers
+    description: >
+      The list is the only channel not rented from a platform. Everything else
+      is downstream of it.
+    metric: newsletter_subscribers
+    target: 500
+    current: 62
+    unit: subscribers
+    priority: 10
+    status: active
+
+  - key: repeat-rate
+    title: Get repeat purchase rate to 25 percent
+    description: >
+      Acquisition is expensive and slow. A second order from an existing
+      customer is the cheapest revenue available.
+    metric: repeat_purchase_rate
+    target: 0.25
+    current: 0.11
+    unit: ratio
+    priority: 20
+    status: active
+
+  - key: catalogue
+    title: Twelve products listed and photographed
+    metric: live_listings
+    target: 12
+    current: 7
+    unit: listings
+    priority: 30
+    status: active
+
+integrations:
+  # Phase 1 ships one adapter: dry_run. It records what it would have done and
+  # performs nothing. The real adapters slot in here later without the
+  # orchestrator changing.
+  github:
+    adapter: dry_run
+    enabled: true
+    options:
+      repo: example-co/shop
+      default_branch: main
+    secret_env:
+      - GITHUB_TOKEN
+
+  social:
+    adapter: dry_run
+    enabled: true
+    options:
+      channels:
+        - facebook-page
+        - instagram
+    secret_env:
+      - BUFFER_ACCESS_TOKEN
+
+  email:
+    adapter: dry_run
+    enabled: true
+    options:
+      from_name: Example Co
+      reply_to: hello@example.invalid
+    secret_env:
+      - GMAIL_REFRESH_TOKEN

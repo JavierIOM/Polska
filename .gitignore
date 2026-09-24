@@ -2,6 +2,19 @@
 .claude/
 .claudememory/
 
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime data: the database, its WAL sidecars, and agent workspaces
+data/
+
 # Dependencies
 node_modules/
 .pnp/
