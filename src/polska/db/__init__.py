@@ -5,6 +5,9 @@ from __future__ import annotations
 from polska.db.base import Base, make_engine, make_session_factory, session_scope
 from polska.db.state import (
     ACTIVE_STATES,
+    DEDUP_LOOKBACK_STATES,
+    DEDUP_NEVER_SUPPRESSES,
+    DEDUP_SUPPRESSING_STATES,
     OPEN_STATES,
     TERMINAL_STATES,
     TRANSITIONS,
@@ -16,6 +19,9 @@ from polska.db.state import (
 
 __all__ = [
     "ACTIVE_STATES",
+    "DEDUP_LOOKBACK_STATES",
+    "DEDUP_NEVER_SUPPRESSES",
+    "DEDUP_SUPPRESSING_STATES",
     "OPEN_STATES",
     "TERMINAL_STATES",
     "TRANSITIONS",

@@ -46,10 +46,36 @@ TERMINAL_STATES: frozenset[TaskState] = frozenset(
 #: States that count against the max-concurrent ceiling.
 ACTIVE_STATES: frozenset[TaskState] = frozenset({TaskState.RUNNING, TaskState.AWAITING_APPROVAL})
 
-#: States the planner must consider when deduplicating new proposals.
+#: Work still in flight. Not, on its own, the right set to dedup against: see
+#: DEDUP_SUPPRESSING_STATES below. FAILED is deliberately not open (it does not count
+#: against the concurrency ceiling) but IS a dedup suppressor, which is why the two
+#: concepts have separate constants rather than sharing this one.
 OPEN_STATES: frozenset[TaskState] = frozenset(
     {TaskState.QUEUED, TaskState.RUNNING, TaskState.AWAITING_APPROVAL}
 )
+
+#: States that must suppress a fresh planner proposal for the same work,
+#: unconditionally, with no lookback window.
+#:
+#: FAILED belongs here even though it is not "open": a failed task with attempts
+#: remaining is the orchestrator's own retry queue, and a fresh proposal for the same
+#: work would race that automatic retry rather than replace it.
+#:
+#: DONE is handled separately by the caller (see DEDUP_LOOKBACK_STATES) because it
+#: should only suppress inside the configured lookback window, not forever.
+DEDUP_SUPPRESSING_STATES: frozenset[TaskState] = OPEN_STATES | {TaskState.FAILED}
+
+#: DONE suppresses a duplicate proposal, but only inside dedup.lookback_days. Kept as
+#: its own set of one so the caller's query makes the time-boxing explicit rather than
+#: burying it in a magic exception.
+DEDUP_LOOKBACK_STATES: frozenset[TaskState] = frozenset({TaskState.DONE})
+
+#: ABANDONED must never suppress a proposal, at any age. It is the one state that
+#: means the system tried and gave up, and it is a bug, not a feature, for that to
+#: quietly stop the same genuine need from ever being proposed again. It is named
+#: here, rather than left as "whatever is not in the two sets above", so the
+#: exclusion is a decision on the page, not an accident of set arithmetic.
+DEDUP_NEVER_SUPPRESSES: frozenset[TaskState] = frozenset({TaskState.ABANDONED})
 
 
 class IllegalTransition(Exception):

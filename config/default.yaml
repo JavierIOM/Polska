@@ -60,8 +60,12 @@ integrations:
 agents:
   # Every agent names its model and its tool allowlist explicitly. No agent
   # inherits a tool, and an empty list means it reasons but touches nothing.
+  #
+  # Model tiers set by Javier on 24 Sep 2026: Opus everywhere was the safe first
+  # default, but not sustainable for a loop firing every 4 hours. Engineering is
+  # the one job worth paying Opus rates for; everything else steps down.
   planner:
-    model: claude-opus-5
+    model: claude-sonnet-5
     tools: []
     max_turns: 6
     timeout_seconds: 300
@@ -81,21 +85,21 @@ agents:
     timeout_seconds: 900
 
   marketer:
-    model: claude-opus-5
+    model: claude-sonnet-5
     # Drafts only. Publishing is an irreversible action and goes to the gate.
     tools: [Read, Write, WebSearch]
     max_turns: 20
     timeout_seconds: 600
 
   support:
-    model: claude-opus-5
+    model: claude-haiku-4-5
     # Reads context and drafts replies. Sending is an irreversible action.
     tools: [Read, Grep]
     max_turns: 15
     timeout_seconds: 600
 
   analyst:
-    model: claude-opus-5
+    model: claude-sonnet-5
     # Reads the database and the web, writes findings back into the task result.
     tools: [Read, Glob, Grep, WebSearch, WebFetch]
     max_turns: 25

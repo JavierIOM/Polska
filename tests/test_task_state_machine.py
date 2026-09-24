@@ -17,6 +17,9 @@ from polska.db.enums import TaskState
 from polska.db.models import Task
 from polska.db.state import (
     ACTIVE_STATES,
+    DEDUP_LOOKBACK_STATES,
+    DEDUP_NEVER_SUPPRESSES,
+    DEDUP_SUPPRESSING_STATES,
     OPEN_STATES,
     TERMINAL_STATES,
     TRANSITIONS,
@@ -76,13 +79,50 @@ def test_terminal_states_are_done_and_abandoned() -> None:
 
 
 def test_active_and_open_state_sets() -> None:
-    """The ceiling and the dedup window read these, so they are pinned."""
+    """The concurrency ceiling reads ACTIVE_STATES; OPEN_STATES is the "in flight"
+    set that DEDUP_SUPPRESSING_STATES builds on. Neither is the dedup set on its own."""
     assert ACTIVE_STATES == {TaskState.RUNNING, TaskState.AWAITING_APPROVAL}
     assert OPEN_STATES == {
         TaskState.QUEUED,
         TaskState.RUNNING,
         TaskState.AWAITING_APPROVAL,
     }
+
+
+def test_dedup_suppressing_states_is_open_plus_failed() -> None:
+    """FAILED suppresses a fresh proposal even though it is not 'open': a failed
+    task with attempts remaining is the orchestrator's own retry queue, and a new
+    planner proposal for the same work would race that retry rather than replace it."""
+    assert DEDUP_SUPPRESSING_STATES == OPEN_STATES | {TaskState.FAILED}
+
+
+def test_dedup_lookback_states_is_done_only() -> None:
+    """DONE suppresses, but the caller must time-box it to the lookback window.
+    It is kept separate from DEDUP_SUPPRESSING_STATES so that time-boxing cannot be
+    forgotten by treating DONE as an unconditional suppressor."""
+    assert DEDUP_LOOKBACK_STATES == {TaskState.DONE}
+
+
+def test_abandoned_never_suppresses_a_new_proposal() -> None:
+    """The one state that must never haunt a future proposal. A task that was
+    abandoned means the system tried and gave up: the underlying need is still open,
+    and a fresh attempt at it is correct behaviour, not duplicate work."""
+    assert DEDUP_NEVER_SUPPRESSES == {TaskState.ABANDONED}
+
+
+def test_the_three_dedup_sets_partition_every_state_with_no_overlap() -> None:
+    """Every state must fall into exactly one bucket. A state in two buckets, or in
+    none, would leave the eventual matching query with undefined behaviour for it."""
+    partition = DEDUP_SUPPRESSING_STATES | DEDUP_LOOKBACK_STATES | DEDUP_NEVER_SUPPRESSES
+    assert partition == set(TaskState)
+
+    pairs = [
+        (DEDUP_SUPPRESSING_STATES, DEDUP_LOOKBACK_STATES),
+        (DEDUP_SUPPRESSING_STATES, DEDUP_NEVER_SUPPRESSES),
+        (DEDUP_LOOKBACK_STATES, DEDUP_NEVER_SUPPRESSES),
+    ]
+    for left, right in pairs:
+        assert not (left & right), f"{left} and {right} overlap"
 
 
 def test_every_non_terminal_state_can_reach_a_terminal_one() -> None:
