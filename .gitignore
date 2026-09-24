@@ -1,0 +1,41 @@
+# Claude
+.claude/
+.claudememory/
+
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build output
+dist/
+.output/
+.vercel/
+.netlify/
+build/
+
+# Astro
+.astro/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+secrets.h
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
