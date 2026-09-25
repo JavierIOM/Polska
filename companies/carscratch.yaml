@@ -1,0 +1,102 @@
+# CarScratch company profile.
+#
+# Built from real facts in llm-wiki/wiki/carscratch.md and the CarScratch repo's own
+# README/CHANGELOG/memory (JavierIOM/CarScratch), as of 24 Sep 2026. Nothing here is
+# invented: where a real number was not available (e.g. traffic or follower counts),
+# the goal is framed around something that is actually known and checkable instead.
+
+slug: carscratch
+name: CarScratch
+active: true
+
+idea: >
+  A free UK and Isle of Man vehicle information lookup: enter a registration plate
+  and get MOT history, mileage history, tax status, ULEZ/CAZ compliance, insurance
+  group, IoM vehicle duty, and whether the vehicle has appeared in an Isle of Man
+  auction with its hammer price. Astro SSR on Netlify. Live at carscratch.uk.
+
+brand_voice: >
+  Friendly and plain. Short sentences, a bit of personality, no corporate tone.
+  Matches the existing Facebook posts: casual, helpful, the odd emoji, never
+  salesy. British English throughout.
+
+constraints:
+  - >-
+    Never name the auction house anywhere user-facing (the site, its copy, meta
+    tags, or any generated output). Use "the auction" or "an Isle of Man auction".
+    Internal filenames and code (chrystals-auctions.json) may name it freely.
+  - >-
+    Auction lot prices of null are ambiguous (no sale, or not yet scraped). Never
+    state or imply a sale outcome without checking the lot's auction date first.
+  - No paid advertising without explicit sign-off.
+  - >-
+    UK and Isle of Man scope only. Do not propose expanding vehicle coverage
+    beyond that without being asked.
+  - Nothing is published under Javier's real name.
+
+goals:
+  - key: auction-data-freshness
+    title: Every auction date fully resolved within a week of the sale
+    description: >
+      Chrystals auctions are scraped pre-auction with price null, then rescraped
+      afterwards to fill in hammer prices. A lot still null after its auction date
+      has either not been rescraped yet or was missed; WITHDRAWN lots should be
+      deleted, not left null. As of 7 Sep 2026 all 845 lots across 12 dates are
+      complete. This is a data-quality goal, not a traffic one: the target is the
+      percentage of past auction dates with every lot resolved, not a raw count.
+    metric: pct_past_auction_dates_fully_resolved
+    target: 100
+    current: 100
+    unit: percent
+    priority: 10
+    status: active
+
+  - key: social-cadence
+    title: Resume a steady Facebook posting cadence
+    description: >
+      A two-posts-a-day schedule ran for at least one week (facebook-posts-week1.md
+      in the repo) covering feature highlights and "did you know" vehicle-history
+      tips. No evidence it has continued since. Reviving it is genuine marketing
+      work, not busywork: the posts written so far are a real, usable template.
+    metric: facebook_posts_published_this_month
+    target: 20
+    current: 0
+    unit: posts
+    priority: 20
+    status: active
+
+  - key: known-issues-zero
+    title: Four consecutive clean known-issues audits
+    description: >
+      The wiki's known-issues log has read "nothing open" since 7 Sep 2026,
+      following a February and a July audit that each found and fixed real
+      problems (leftover backup files, a duplicate public JSON copy, missing
+      favicons, stray debug logging). One clean audit has happened so far (7
+      Sep, confirming the July findings stayed fixed). The goal is to keep
+      finding this early through periodic review, roughly quarterly, not to
+      assume it stays true on its own.
+    metric: consecutive_clean_audits
+    target: 4
+    current: 1
+    unit: audits
+    priority: 30
+    status: active
+
+integrations:
+  github:
+    adapter: dry_run
+    enabled: true
+    options:
+      repo: JavierIOM/CarScratch
+      default_branch: master
+    secret_env:
+      - GITHUB_TOKEN
+
+  social:
+    adapter: dry_run
+    enabled: true
+    options:
+      channels:
+        - facebook-page
+    secret_env:
+      - BUFFER_ACCESS_TOKEN

@@ -30,6 +30,13 @@ def test_the_example_company_profile_is_valid() -> None:
     assert loaded.sha256 == profile_hash(loaded.raw)
 
 
+def test_the_carscratch_company_profile_is_valid() -> None:
+    loaded = load_company_profile(REPO_ROOT / "companies" / "carscratch.yaml")
+    assert loaded.profile.slug == "carscratch"
+    assert len(loaded.profile.open_goals) == 3
+    assert loaded.sha256 == profile_hash(loaded.raw)
+
+
 def test_every_agent_has_an_explicit_tool_allowlist(app_config: AppConfig) -> None:
     """No agent may inherit tools. An empty list is fine, an absent one is not."""
     for name, agent in app_config.agents.items():
