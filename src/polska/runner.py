@@ -203,7 +203,7 @@ class AgentRunner:
         the call and to one of ``done``, ``awaiting_approval``, ``failed`` or
         ``abandoned`` after, depending on what the agent returned, what the gate did
         with any actions it proposed, and whether this was the task's last permitted
-        attempt (see :meth:`_fail_or_abandon`). The caller decides *whether* to run
+        attempt (see :meth:`fail_or_abandon`). The caller decides *whether* to run
         this task; this method is what actually running it means.
         """
         task.transition_to(TaskState.RUNNING)
@@ -222,13 +222,13 @@ class AgentRunner:
 
         result = outcome.output
         if not isinstance(result, AgentResult):
-            self._fail_or_abandon(
+            self.fail_or_abandon(
                 session, task, outcome.run.error or "The agent's output did not validate."
             )
             return outcome
 
         if not result.succeeded:
-            self._fail_or_abandon(session, task, result.failure_reason)
+            self.fail_or_abandon(session, task, result.failure_reason)
             return outcome
 
         any_pending = False
@@ -253,7 +253,7 @@ class AgentRunner:
         session.commit()
         return outcome
 
-    def _fail_or_abandon(self, session: Session, task: Task, reason: str) -> None:
+    def fail_or_abandon(self, session: Session, task: Task, reason: str) -> None:
         """Move a task out of ``running`` after a failure, to ``failed`` if it may
         still be retried, or to ``abandoned`` if it has run out of either attempts
         or budget.
@@ -451,6 +451,17 @@ class AgentRunner:
             # a run mid-flight; the reservation is what stops two runs racing the
             # ledger before either has spent anything.
             max_budget_usd=self._config.budget.max_usd_per_run,
+            # SDK isolation mode. Left at its default (None), every call loads
+            # ~/.claude/settings.json, any .claude/settings.json or
+            # .claude/settings.local.json found from cwd, and CLAUDE.md: whoever's
+            # personal Claude Code configuration happens to be on the host,
+            # completely unrelated to running a company. Measured directly: this
+            # was inflating a single dedup judge call to 28k+ cached tokens before
+            # this was set. An empty list is the SDK's own name for "load nothing
+            # from disk"; it is not related to allowed_tools, which still governs
+            # which tools the agent may call regardless of this setting.
+            setting_sources=[],
+            effort=agent_config.effort,
         )
 
         # Written before the SDK is ever called, in `running` state, so a crash

@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_the_shipped_config_is_valid(app_config: AppConfig) -> None:
-    assert app_config.scheduler.interval_hours == 4
+    assert app_config.scheduler.interval_hours == 24
     assert set(app_config.agents) == set(AgentName)
 
 

@@ -5,11 +5,89 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-09-24
+## [0.3.1] - 2026-09-25
 
-Phase 3 of 5: orchestrator loop and scheduler.
+The first real dry run, against CarScratch: constraints from an actual repo audit,
+a per-task read-only repo clone, a settings-isolation fix, and a real overshoot
+bug found and fixed by that same dry run.
 
 ### Added
+
+- CarScratch profile: 13 hard constraints from a direct audit of the CarScratch
+  repo (never touch the gov.im or CheckCarDetails scraping paths, never raise
+  scrape rate, never claim data accuracy, no analytics, master is protected,
+  no mock-as-real, no inference-as-observation, verifiable artefacts only, no
+  re-proposing what a human stopped, Buffer/Instagram limits, no em-dashes).
+  `social-cadence` goal dropped per instruction (lowest-value work, not wanted
+  yet); replaced with `upstream-monitoring` (detect the site's six silently-
+  failing data sources before a user reports it). `known-issues-audit` tightened
+  to name its own pass criteria (an explicit checklist against real files, not
+  an assertion), since as first written an agent could pass it by doing nothing.
+- `polska/workspace.py`: `prepare_task_workspace` clones a company's repo at its
+  configured `working_branch` into `<task>/repo/`, for engineering *and* research
+  tasks (the analyst reads real code as much as the engineer does). The
+  credential is read once from the profile's `secret_env`, passed to exactly one
+  `git clone` subprocess call as a transient `GIT_CONFIG_KEY_0` override (verified
+  directly: leaves no trace in the resulting `.git/config`), and the clone's
+  `.git` directory is deleted regardless as a second layer. The tree is then made
+  read-only and stripped of dependency lockfiles and binary assets (see Fixed).
+  `AgentRunner.fail_or_abandon` (renamed from a private method so this module can
+  call it) applies the same attempts/cost exhaustion logic to a failed clone as
+  to a failed agent run, so a persistently broken profile setting still abandons
+  rather than looping forever.
+- `AgentConfig.effort`, set to `low` for the planner (a classification-shaped
+  decision, not open-ended reasoning). Not set for the dedup judge: Haiku 4.5
+  does not support the `effort` parameter at all and would 400 on it, unlike
+  Sonnet/Opus tier.
+- `scripts/observe_ticks.py`, promoted from a scratchpad one-off to a permanent
+  dev tool: runs N real ticks against a named company profile and prints the
+  activity feed, a per-run cost breakdown by agent, and every task's state and
+  dedup note. Respects `integrations.force_dry_run` and warns if it is off.
+- `scheduler.interval_hours` set to 24 (daily). Measured cost, not budget, was
+  never the constraint on this; how often the business actually changes is.
+
+### Fixed
+
+- **Every agent call was silently loading Javier's personal Claude Code
+  configuration.** `ClaudeAgentOptions.setting_sources` was never set, and its
+  documented default is "all sources are loaded, matching CLI defaults":
+  `~/.claude/settings.json`, any project `.claude/settings.json`, and CLAUDE.md.
+  Measured directly on a single dedup judge call: 28k+ tokens of cache creation
+  for a request whose actual content was under 1k tokens. Fixed with
+  `setting_sources=[]` (the SDK's own name for "load nothing from disk"; unrelated
+  to `allowed_tools`, which still governs which tools an agent may call). This was
+  inflating every measured cost figure and, worse, meant every agent's behaviour
+  could have been influenced by personal rules that have nothing to do with
+  running a company.
+- **A real run blew 5-10x past its own budget reservation before the guard's
+  safety nets caught it**, found by the first CarScratch dry run: an analyst run
+  hit its `max_turns` ceiling at 928k tokens (reservation: 200k) and an engineer
+  run hit the SDK's own `max_budget_usd` at $3.15 against a $3.00 ceiling, having
+  already used 2.03M tokens. Root cause, confirmed against the real repo: a
+  478KB `package-lock.json` and a 124KB data file, both tracked in git, land in
+  every clone with nothing stopping a broad read from pulling either in whole,
+  repeatedly. `prepare_task_workspace` now strips lockfiles and binary assets
+  from the clone outright, warns on anything else large enough to matter, and
+  both worker prompts now say explicitly to Grep/Glob rather than read a large
+  file wholesale. The budget guard's own enforcement worked exactly as designed
+  once triggered (a `BudgetHalt` correctly blocked every subsequent reservation
+  for the company until cleared); this fixes what caused the trigger, not the
+  guard's response to it. **Partial, not complete**: a second measured dry run
+  after this fix still saw two Opus-tier engineer runs at 351k and 471k tokens
+  against the same 200k reservation, roughly half the first run's overshoot but
+  still over. Both also ended on the account running out of credit mid-call
+  rather than on the SDK's own ceiling, so how much of that figure is genuine
+  task size versus an arbitrary cutoff point is not yet known. See the session
+  notes on the wiki for the open per-agent-ceiling question this points at.
+- `_force_rmtree`: a plain `shutil.rmtree(path, ignore_errors=True)` silently
+  left `.git` behind on Windows, because git marks some of its own files
+  (pack files) read-only and `ignore_errors=True` swallows the resulting
+  `PermissionError` rather than fixing it. Caught by a test asserting `.git` was
+  actually gone, not just attempted-to-be-gone. Fixed with an `onexc` handler
+  that clears the read-only bit and retries; a directory that still can't be
+  removed after that now raises `WorkspaceError` instead of proceeding with a
+  workspace that still holds the remote URL.
+- 11 new tests (`test_workspace.py`). 238 tests total.
 
 - `Goal.key`: the stable identifier a company profile's `GoalSpec.key` needs to
   resolve against, unique per company. Missing from the phase 1 schema; a planner

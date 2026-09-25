@@ -4,9 +4,10 @@ An autonomous company operator. An orchestrator decides what a business needs ne
 then dispatches agents to do it on a schedule, without anyone driving each step.
 
 Phases 1 through 3 of 5 are built: schema, models, migrations, the agent runner,
-cost accounting, and the orchestrator loop and scheduler. Nothing has been run
-against a live Anthropic API key yet: every test runs against a fake SDK stream, by
-design (see Tests below).
+cost accounting, and the orchestrator loop and scheduler. It has now run for real
+against a live key, against the CarScratch profile: see the dry run notes under
+Tests, and the two real bugs that run found and this fixed. Every automated test
+still runs against a fake SDK stream, by design.
 
 ## Build status
 
@@ -145,6 +146,20 @@ These are not negotiable and the tests enforce several of them.
   (`rapidfuzz` token-set ratio) with an LLM tiebreak batched through the dedup
   judge for whatever falls in the ambiguous band; a judge call that fails or gives
   no usable verdict defaults to kept, never dropped.
+- **A worker never holds a repository credential.** `prepare_task_workspace` reads
+  the token, hands it to exactly one `git clone` subprocess call as a transient
+  environment variable, and it is gone: never written to a file, never in the
+  clone's `.git/config` (verified directly), and `.git` is deleted from the
+  checkout regardless as a second layer. The clone is then made read-only and
+  stripped of dependency lockfiles and binary assets, the two things that measured
+  contribution to a real run blowing well past its token reservation on its first
+  live outing.
+- **Every SDK call is isolated from whoever's host it runs on.**
+  `setting_sources=[]` is set on every `ClaudeAgentOptions`. Left at its default,
+  every call loads `~/.claude/settings.json`, any project settings found from
+  `cwd`, and CLAUDE.md: someone's personal Claude Code configuration, entirely
+  unrelated to running a company, and measured to cost real tokens doing it
+  (28k+ cached tokens on one otherwise-trivial call before this was set).
 - **Every agent names its model and its tool allowlist explicitly.** Nothing is
   inherited. An empty list means the agent reasons but touches nothing.
 - **Reversible actions run immediately; irreversible ones never do.** They write a
@@ -203,7 +218,10 @@ src/polska/
   sync.py                Loads a company profile's goals into the database.
   dedup.py               Deterministic fuzzy match plus the judge tiebreak.
   orchestrator.py        One company's tick: plan, dedup, enqueue, requeue, dispatch.
+  workspace.py            Clones a company's repo into a task's workspace, read-only.
   main.py                The process entrypoint: startup recovery, then the scheduler.
+scripts/
+  observe_ticks.py        Run N real ticks against a company and print what happened.
 tests/
 ```
 
@@ -244,7 +262,20 @@ profile from disk on each firing and ticks each active one in turn.
 
 ## Tests
 
-226 tests, no network, about eight seconds.
+238 tests, no network, about twelve seconds.
+
+### Live dry run
+
+Run for real, against CarScratch, twice: `.venv\Scripts\python.exe scripts\observe_ticks.py carscratch 3`.
+The first run found two real bugs (the settings-isolation leak and a run
+overshooting its own reservation by 5-10x on a repo clone containing a large
+lockfile); both are fixed and covered by tests. A second run with the fixes in
+place still overshot, by less (roughly half), and both attempts in it ended on
+the account running out of credit rather than on a controlled ceiling, so
+whether 200k is simply too tight for an Opus-tier engineering task against a
+real repo is still an open question, not yet answered on clean data. Full
+account of both runs, real dollar figures and what was proposed and why: the
+`polska.md` wiki page.
 
 The state machine is tested exhaustively rather than by example: all 36 ordered pairs
 of states are asserted legal or illegal against a table written independently of the

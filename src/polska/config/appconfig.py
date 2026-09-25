@@ -7,7 +7,7 @@ the dashboard, and is the single place a ceiling or a model tier is set.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -170,6 +170,12 @@ class AgentConfig(BaseModel):
     enabled: bool = True
     #: Extra text appended to the agent's built-in system prompt.
     system_prompt_extra: str = ""
+    #: Thinking depth, passed straight to the SDK's own `effort`. None leaves the
+    #: model's default (adaptive thinking, uncontrolled depth) in place. A
+    #: classification-shaped call (the planner, the dedup judge) rarely needs
+    #: more than "low"; a worker actually doing the task is left alone unless
+    #: there is a specific reason to change it.
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
 
 class ApprovalConfig(BaseModel):

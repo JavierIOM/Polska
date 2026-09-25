@@ -36,6 +36,7 @@ from polska.dedup import deduplicate
 from polska.runner import AgentRunner
 from polska.schemas.planner import PlannerOutput
 from polska.sync import sync_company
+from polska.workspace import WorkspaceError, prepare_task_workspace
 
 logger = logging.getLogger("polska.orchestrator")
 
@@ -50,6 +51,12 @@ TASK_TYPE_TO_AGENT: dict[TaskType, AgentName] = {
 
 #: States a "recent outcomes" query looks at: work that has actually concluded.
 _CONCLUDED_STATES = frozenset({TaskState.DONE, TaskState.FAILED, TaskState.ABANDONED})
+
+#: Task types that get a repo clone in their workspace. Research needs to read
+#: real code as much as engineering does, arguably more: every worker mapped to
+#: TaskType.RESEARCH (the analyst) only ever reads, so giving it the clone carries
+#: none of the write-access risk engineering's own tool allowlist otherwise would.
+_TASK_TYPES_WITH_A_WORKSPACE = frozenset({TaskType.ENGINEERING, TaskType.RESEARCH})
 
 
 class TickSummary:
@@ -427,9 +434,24 @@ async def _dispatch_one(
         user_prompt = _build_worker_prompt(task, task.goal)
 
         workspace: Path | None = None
-        if task.type == TaskType.ENGINEERING:
-            workspace = workspace_root / str(task.id)
-            workspace.mkdir(parents=True, exist_ok=True)
+        if task.type in _TASK_TYPES_WITH_A_WORKSPACE:
+            # A read-only clone of the company's repo, if one is configured, so
+            # engineering and research tasks alike have real code to read instead
+            # of an empty directory. See workspace.py for how the credential is
+            # kept out of its reach.
+            try:
+                workspace = prepare_task_workspace(company_profile, workspace_root, task.id)
+            except WorkspaceError as exc:
+                # The task never reached the agent, but it was still a real
+                # attempt (a broken repo slug, a dead token, a network outage),
+                # and it must count as one: transition through running first so
+                # fail_or_abandon sees the same attempts/cost picture it always
+                # does, rather than a bespoke path that could loop forever on a
+                # persistently wrong profile setting.
+                task.transition_to(TaskState.RUNNING)
+                session.commit()
+                runner.fail_or_abandon(session, task, str(exc))
+                return
 
         await runner.run_worker(
             session,

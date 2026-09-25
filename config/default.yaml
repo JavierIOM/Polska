@@ -6,7 +6,10 @@
 
 scheduler:
   enabled: true
-  interval_hours: 4
+  # Daily. How often the business actually changes is the question that decides
+  # this, not the per-tick cost: measured, an idle tick and a working one are both
+  # cheap enough that the interval was never a budget decision.
+  interval_hours: 24
   jitter_seconds: 300
   run_on_start: false
   coalesce: true
@@ -86,12 +89,18 @@ agents:
     tools: []
     max_turns: 6
     timeout_seconds: 300
+    # A planning decision is closer to classification than open-ended reasoning.
+    effort: low
 
   dedup_judge:
     model: claude-haiku-4-5
     tools: []
     max_turns: 2
     timeout_seconds: 120
+    # No effort here: Haiku 4.5 does not support the effort parameter at all,
+    # unlike Sonnet/Opus tier models. Setting one would 400 every judge call.
+    # Haiku's cost variance is already low since it gets no adaptive thinking
+    # by default (only Sonnet/Opus tier think unless explicitly configured).
 
   engineer:
     model: claude-opus-5

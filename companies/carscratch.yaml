@@ -21,13 +21,50 @@ brand_voice: >
   salesy. British English throughout.
 
 constraints:
+  # From a direct audit of the CarScratch repo, 25 Sep 2026. Not negotiable.
+  - >-
+    Never modify the Isle of Man gov.im scraping path (iom-scraper.ts) without
+    explicit human approval. It is regex parsing of a government UI with no
+    official API and no fallback.
+  - >-
+    Never modify the CheckCarDetails scraping path or the ScraperAPI and scrape.do
+    fallback chain without approval. Direct fetch from Netlify is blocked, so a
+    broken proxy chain means no specs at all.
+  - >-
+    Never increase request rate, remove the 2 second throttle, or add retries
+    against any scraped source. Getting the source IP blocked is unrecoverable.
+  - >-
+    Never make any claim about data accuracy, completeness or reliability in
+    copy, page content or social posts. The site's published disclaimer states
+    the opposite.
+  - >-
+    Never introduce analytics, cookies, tracking or third party scripts. The
+    privacy statement claims none and that must stay true.
+  - Never push to master. All work goes to dev.
+  - Never contact any data provider, government body or third party site.
+  - >-
+    Never present mock data as real. Missing MOT_CLIENT_ID or DVLA_API_KEY
+    causes a silent fallback to mocks.
+  - >-
+    Never present inference or estimate as observation, and never attribute a
+    claim to a source that was not actually consulted.
+  - >-
+    Never mark a task complete without a verifiable artefact. An agent's own
+    assertion is not proof.
+  - >-
+    Never re-propose or re-execute anything a human has explicitly stopped or
+    taken down.
+  - >-
+    Never exceed 8 scheduled Buffer posts at once, never target the Instagram
+    channel (disconnected, fails silently), and post only to the CarScratch
+    Facebook channel.
+  - Never use em-dashes in any output.
+
+  # House constraints, unchanged from the first draft.
   - >-
     Never name the auction house anywhere user-facing (the site, its copy, meta
     tags, or any generated output). Use "the auction" or "an Isle of Man auction".
     Internal filenames and code (chrystals-auctions.json) may name it freely.
-  - >-
-    Auction lot prices of null are ambiguous (no sale, or not yet scraped). Never
-    state or imply a sale outcome without checking the lot's auction date first.
   - No paid advertising without explicit sign-off.
   - >-
     UK and Isle of Man scope only. Do not propose expanding vehicle coverage
@@ -51,31 +88,43 @@ goals:
     priority: 10
     status: active
 
-  - key: social-cadence
-    title: Resume a steady Facebook posting cadence
+  - key: upstream-monitoring
+    title: Detect upstream data-source breakage before a user reports it
     description: >
-      A two-posts-a-day schedule ran for at least one week (facebook-posts-week1.md
-      in the repo) covering feature highlights and "did you know" vehicle-history
-      tips. No evidence it has continued since. Reviving it is genuine marketing
-      work, not busywork: the posts written so far are a real, usable template.
-    metric: facebook_posts_published_this_month
-    target: 20
+      The site depends on six external data sources (DVLA vehicle and tax data,
+      MOT history, gov.im for Isle of Man plates, and the CheckCarDetails scrape
+      behind the ScraperAPI/scrape.do proxy chain, among others), every one of
+      which can fail silently: a missing MOT_CLIENT_ID or DVLA_API_KEY falls back
+      to mock data with no visible error, and a broken proxy chain just returns
+      nothing. Right now breakage is found from a user complaint, or not at all.
+      This is pure observability: identify each source's failure mode and propose
+      a way to detect it (a health check, a log line that can be alerted on, a
+      status page, whatever fits) without touching how any source is actually
+      fetched. Nothing about this goal permits editing a scraper's request logic.
+    metric: monitored_data_sources
+    target: 6
     current: 0
-    unit: posts
+    unit: sources
     priority: 20
     status: active
 
-  - key: known-issues-zero
-    title: Four consecutive clean known-issues audits
+  - key: known-issues-audit
+    title: A known-issues audit that actually checks something
     description: >
       The wiki's known-issues log has read "nothing open" since 7 Sep 2026,
       following a February and a July audit that each found and fixed real
-      problems (leftover backup files, a duplicate public JSON copy, missing
-      favicons, stray debug logging). One clean audit has happened so far (7
-      Sep, confirming the July findings stayed fixed). The goal is to keep
-      finding this early through periodic review, roughly quarterly, not to
-      assume it stays true on its own.
-    metric: consecutive_clean_audits
+      problems: leftover backup files, a duplicate public JSON copy, missing
+      favicons, stray debug logging. A pass on this goal requires an explicit
+      checklist run against the real repository, each item with its result
+      stated, not a bare "looks fine": no file matching *.astroold, *.bak or *~
+      under src/; no duplicate of chrystals-auctions.json under public/data/;
+      all five favicon sizes present (16, 32, 192, 512, apple-touch-icon); zero
+      console.log calls under src/lib/; the about page's description of the
+      scraping method matches what the code actually does. An agent's own
+      assertion that the code "looks clean" is not a pass, per the standing
+      verifiable-artefact constraint: the checklist result is the artefact.
+      One clean audit exists so far (7 Sep, confirming the July fixes held).
+    metric: consecutive_clean_checklist_audits
     target: 4
     current: 1
     unit: audits
@@ -89,6 +138,10 @@ integrations:
     options:
       repo: JavierIOM/CarScratch
       default_branch: master
+      # The branch the engineer's read-only clone checks out. Deliberately not
+      # default_branch: dev is where CarScratch's own work happens, master is
+      # what deploys, and a push to master is what the approval gate protects.
+      working_branch: dev
     secret_env:
       - GITHUB_TOKEN
 
