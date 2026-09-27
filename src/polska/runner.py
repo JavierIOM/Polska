@@ -652,6 +652,15 @@ class AgentRunner:
                 limit_name="mid_run_watchdog",
                 reason=error_text or "Run interrupted after crossing its own ceiling mid-stream.",
             )
+            log(
+                session,
+                company_id=company_id,
+                kind=ActivityKind.BUDGET_HALT,
+                summary=f"{agent_name.value} cut off mid-stream: crossed its own run ceiling",
+                task_id=task.id if task else None,
+                run_id=run.id,
+                error=error_text,
+            )
 
         if result_message is not None:
             raw_output = raw_output or result_message.result
