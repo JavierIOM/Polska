@@ -18,6 +18,7 @@ Pydantic model actually validating it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -44,10 +45,10 @@ from sqlalchemy.orm import Session
 
 from polska.activity import log
 from polska.adapters.registry import AdapterRegistry
-from polska.budget import BudgetExceeded, BudgetGuard, actual_usd_for_task
+from polska.budget import BudgetExceeded, BudgetGuard, actual_usd_for_task, write_halt
 from polska.config.appconfig import AppConfig
 from polska.config.company import CompanyProfile
-from polska.db.enums import ActivityKind, AgentName, RunStatus, TaskState
+from polska.db.enums import ActivityKind, AgentName, BudgetScope, RunStatus, TaskState
 from polska.db.models import Run, Task
 from polska.db.types import utcnow
 from polska.gate import dispatch_action
@@ -61,6 +62,20 @@ SchemaT = TypeVar("SchemaT", bound=BaseModel)
 #: The SDK-native async generator signature ``AgentRunner`` calls. Tests substitute a
 #: fake with the same signature so nothing in this module ever reaches the network.
 QueryFn = Callable[..., AsyncIterator[Message]]
+
+#: Conservative chars-per-token for the pre-dispatch size estimate below: deliberately
+#: lower than the ~4 chars/token an English-prose rule of thumb would give, so this
+#: estimate errs toward refusing early rather than under-counting and letting an
+#: oversized prompt through. There is no token-counting call here (the Messages API's
+#: count_tokens would be exact, but it is a network round trip on the critical path of
+#: deciding whether to spend money at all, and this project's pricing is already in
+#: dollars-per-token, not something that needs perfect precision to be a useful gate).
+_CONSERVATIVE_CHARS_PER_TOKEN = 3.0
+
+
+def _estimate_tokens(text: str) -> int:
+    """A deliberately pessimistic token estimate for text known before dispatch."""
+    return int(len(text) / _CONSERVATIVE_CHARS_PER_TOKEN)
 
 
 class InvocationResult:
@@ -121,6 +136,69 @@ def _extract_usage(
         return input_tokens, output_tokens, cache_read, cache_creation, cost_usd
 
     return 0, 0, 0, 0, 0.0
+
+
+class _RunningUsage:
+    """Usage accumulated live, one ``AssistantMessage`` at a time.
+
+    ``AssistantMessage.usage`` is per-turn, not cumulative (confirmed against the
+    SDK's own source), so this adds each turn in rather than taking the latest value.
+    This is what lets a run be judged against its ceiling *before* it ends, which is
+    the entire point: the post-hoc check in budget.py only ever sees the final total.
+    """
+
+    __slots__ = ("cache_creation", "cache_read", "input_tokens", "output_tokens")
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read = 0
+        self.cache_creation = 0
+
+    def add(self, usage: dict[str, Any]) -> None:
+        self.input_tokens += int(usage.get("input_tokens", 0))
+        self.output_tokens += int(usage.get("output_tokens", 0))
+        self.cache_read += int(usage.get("cache_read_input_tokens", 0))
+        self.cache_creation += int(usage.get("cache_creation_input_tokens", 0))
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens + self.cache_read + self.cache_creation
+
+    def cost_usd(self, app_config: AppConfig, model: str) -> float:
+        price = app_config.price_for(model)
+        return price.cost_usd(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_read_tokens=self.cache_read,
+            cache_creation_tokens=self.cache_creation,
+        )
+
+    def as_tuple(self, app_config: AppConfig, model: str) -> tuple[int, int, int, int, float]:
+        return (
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read,
+            self.cache_creation,
+            self.cost_usd(app_config, model),
+        )
+
+    def exceeds(self, app_config: AppConfig, model: str) -> str | None:
+        """A human-readable reason the run has crossed its own ceiling, or ``None``."""
+        budget = app_config.budget
+        tokens = self.total_tokens
+        if tokens > budget.max_tokens_per_run:
+            return (
+                f"Cut off mid-stream: {tokens} tokens spent against a "
+                f"{budget.max_tokens_per_run} token run ceiling."
+            )
+        cost = self.cost_usd(app_config, model)
+        if cost > budget.max_usd_per_run:
+            return (
+                f"Cut off mid-stream: ${cost:.4f} spent against a "
+                f"${budget.max_usd_per_run:.2f} run ceiling."
+            )
+        return None
 
 
 class AgentRunner:
@@ -434,6 +512,26 @@ class AgentRunner:
         system_prompt = build_system_prompt(agent_name, agent_config, company=company_profile)
         schema = schema_model.model_json_schema()
 
+        # Measured before a single token is sent. This cannot see what a worker's
+        # own tool calls will pull in later (that is what the mid-stream watchdog
+        # below is for), but the fixed part of the request -- the system prompt,
+        # the task prompt, the schema handed to --json-schema -- is fully known
+        # right now, and there is no reason to ever dispatch a call whose input
+        # alone already costs more than the run is allowed to spend.
+        blocked = self._check_input_size(
+            session,
+            agent_name=agent_name,
+            company_id=company_id,
+            task=task,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+            started=started,
+        )
+        if blocked is not None:
+            return blocked, None
+
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             allowed_tools=list(agent_config.tools),
@@ -447,9 +545,10 @@ class AgentRunner:
             cwd=str(cwd) if cwd is not None else None,
             output_format={"type": "json_schema", "schema": schema},
             # The SDK's own enforcement of the same figure the reservation holds.
-            # Belt and braces, not a replacement for the reservation: this can stop
-            # a run mid-flight; the reservation is what stops two runs racing the
-            # ledger before either has spent anything.
+            # Real, but not exact: measured directly, a run has still spent 5% over
+            # this figure before the SDK's own check caught it. The mid-stream
+            # watchdog below is what actually holds the line; this is one more
+            # layer, not the layer.
             max_budget_usd=self._config.budget.max_usd_per_run,
             # SDK isolation mode. Left at its default (None), every call loads
             # ~/.claude/settings.json, any .claude/settings.json or
@@ -487,13 +586,34 @@ class AgentRunner:
         raw_output: str | None = None
         structured: Any = None
         validated: BaseModel | None = None
+        # Accumulated as messages stream in, so a run that never reaches a
+        # ResultMessage (timed out, errored, or actively cut off below) still has
+        # a real usage figure recorded instead of the zero _extract_usage(None, ...)
+        # would otherwise give it.
+        running = _RunningUsage()
 
         try:
             async with asyncio.timeout(agent_config.timeout_seconds):
-                async for message in self._query_fn(prompt=user_prompt, options=options):
+                stream = self._query_fn(prompt=user_prompt, options=options)
+                async for message in stream:
                     self._collect_message(message, tools_called, text_parts)
                     if isinstance(message, ResultMessage):
                         result_message = message
+                    elif isinstance(message, AssistantMessage) and message.usage:
+                        running.add(message.usage)
+                        overshoot = running.exceeds(self._config, model)
+                        if overshoot is not None:
+                            # This is the fix for a real incident: a run spent
+                            # 10x its reservation because nothing checked usage
+                            # until the run had already finished (or the SDK's
+                            # own max_budget_usd happened to catch it, which
+                            # measured 5% over before it did). Stopping the
+                            # stream here is what makes the ceiling a control
+                            # rather than a number recorded after the fact.
+                            status = RunStatus.INTERRUPTED
+                            error_text = overshoot
+                            await stream.aclose()
+                            break
         except TimeoutError:
             status = RunStatus.TIMED_OUT
             error_text = f"Exceeded its {agent_config.timeout_seconds}s wall-clock timeout."
@@ -514,7 +634,7 @@ class AgentRunner:
                 run=run,
                 raw_output=None,
                 tools_called=tools_called,
-                usage=(0, 0, 0, 0, 0.0),
+                usage=running.as_tuple(self._config, model),
                 status=RunStatus.FAILED,
                 error="The Claude Agent SDK's CLI could not be reached or found.",
                 session_id=None,
@@ -522,6 +642,16 @@ class AgentRunner:
                 started=started,
             )
             raise
+
+        if status == RunStatus.INTERRUPTED:
+            self._write_run_halt(
+                session,
+                company_id=company_id,
+                run=run,
+                observed_value=running.cost_usd(self._config, model),
+                limit_name="mid_run_watchdog",
+                reason=error_text or "Run interrupted after crossing its own ceiling mid-stream.",
+            )
 
         if result_message is not None:
             raw_output = raw_output or result_message.result
@@ -552,7 +682,11 @@ class AgentRunner:
                 error_text = str(exc)
                 validated = None
 
-        usage = _extract_usage(result_message, self._config, model)
+        if result_message is not None:
+            usage = _extract_usage(result_message, self._config, model)
+        else:
+            usage = running.as_tuple(self._config, model)
+
         self._finalize_run(
             session,
             run=run,
@@ -566,6 +700,100 @@ class AgentRunner:
             started=started,
         )
         return run, validated
+
+    def _check_input_size(
+        self,
+        session: Session,
+        *,
+        agent_name: AgentName,
+        company_id: int,
+        task: Task | None,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        schema: dict[str, Any],
+        started: Any,
+    ) -> Run | None:
+        """Refuse to dispatch if the *known* input alone would already breach the
+        run's ceiling. Returns a written, terminal ``Run`` row if it does, else
+        ``None`` to mean "fine, carry on"."""
+        estimated_tokens = (
+            _estimate_tokens(system_prompt)
+            + _estimate_tokens(user_prompt)
+            + _estimate_tokens(json.dumps(schema))
+        )
+        price = self._config.price_for(model)
+        estimated_usd = price.cost_usd(input_tokens=estimated_tokens, output_tokens=0)
+        budget = self._config.budget
+
+        within_tokens = estimated_tokens <= budget.max_tokens_per_run
+        within_usd = estimated_usd <= budget.max_usd_per_run
+        if within_tokens and within_usd:
+            return None
+
+        reason = (
+            f"Input alone is an estimated {estimated_tokens} tokens (~${estimated_usd:.4f} "
+            f"at {model}'s input rate) before a single reply token: over the "
+            f"{budget.max_tokens_per_run} token / ${budget.max_usd_per_run:.2f} run ceiling "
+            "on the known, fixed part of the request alone. Refused rather than dispatched."
+        )
+        run = Run(
+            company_id=company_id,
+            task_id=task.id if task else None,
+            agent=agent_name,
+            model=model,
+            system_prompt=system_prompt,
+            prompt=user_prompt,
+            tools_called=[],
+            status=RunStatus.BUDGET_BLOCKED,
+            error=reason,
+            started_at=started,
+            finished_at=utcnow(),
+            duration_ms=0,
+        )
+        session.add(run)
+        session.flush()
+        self._write_run_halt(
+            session,
+            company_id=company_id,
+            run=run,
+            observed_value=estimated_usd,
+            limit_name="pre_dispatch_input_size",
+            reason=reason,
+        )
+        log(
+            session,
+            company_id=company_id,
+            kind=ActivityKind.BUDGET_HALT,
+            summary=(
+                f"{agent_name.value} refused before dispatch: input alone exceeds its run ceiling"
+            ),
+            task_id=task.id if task else None,
+            run_id=run.id,
+            error=reason,
+        )
+        return run
+
+    def _write_run_halt(
+        self,
+        session: Session,
+        *,
+        company_id: int,
+        run: Run,
+        observed_value: float,
+        limit_name: str,
+        reason: str,
+    ) -> None:
+        write_halt(
+            session,
+            company_id=company_id,
+            scope=BudgetScope.RUN,
+            limit_name=limit_name,
+            limit_value=self._config.budget.max_usd_per_run,
+            observed_value=observed_value,
+            period_key=None,
+            reason=f"Run {run.id}: {reason}",
+        )
 
     @staticmethod
     def _collect_message(

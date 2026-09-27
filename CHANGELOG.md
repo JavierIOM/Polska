@@ -5,6 +5,45 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-09-27
+
+The budget guard was bookkeeping, not control: `max_budget_usd` reached the SDK but
+never actually stopped an observed overrun (one was caught by `max_turns`, two by the
+Anthropic account running out of credit externally), and there was no mid-run check
+on token spend at all, only a post-hoc record after the run had already finished.
+Fixed with an active mid-stream watchdog and a pre-dispatch input-size refusal. A
+verification rerun against CarScratch is blocked, separately, by the account having
+no credit right now.
+
+### Added
+
+- `RunStatus.INTERRUPTED`: Polska cut a run off itself, mid-stream, after it crossed
+  its own ceiling. Distinct from `BUDGET_BLOCKED` (never dispatched at all) and from
+  `FAILED` (the CLI ended on its own terms) so the record never conflates "we refused
+  to start" with "we started and then stopped it ourselves."
+- `AgentRunner._RunningUsage`: accumulates real usage from every `AssistantMessage`
+  as a run streams in (per-turn, not cumulative), and can price itself against the
+  same pricing table used everywhere else.
+- `AgentRunner._check_input_size`: estimates the system prompt, task prompt and
+  `--json-schema` payload before a call is ever dispatched (a deliberately
+  pessimistic 3 chars/token heuristic, no network round-trip), and refuses to call
+  the SDK at all as `BUDGET_BLOCKED` if that alone would breach the run's ceiling.
+- Two tests against the fake SDK: one proves the mid-stream watchdog closes the
+  stream and stops pulling further messages the instant the ceiling is crossed; the
+  other proves the fake `query_fn` is never invoked when the pre-dispatch check
+  refuses.
+
+### Changed
+
+- `_execute_and_record` now holds an explicit stream handle (`stream =
+  self._query_fn(...)`) instead of iterating a bare `async for`, so it can call
+  `await stream.aclose()` on crossing the ceiling — the SDK's own documented
+  mechanism for a caller to stop a stream early, already used internally by
+  `client.py`'s own cleanup path.
+- A run that ends without ever receiving a `ResultMessage` (interrupted, timed out,
+  or errored) now records its real accumulated usage from `_RunningUsage`, instead
+  of the zeroed figure `_extract_usage(None, ...)` previously gave it.
+
 ## [0.3.1] - 2026-09-25
 
 The first real dry run, against CarScratch: constraints from an actual repo audit,

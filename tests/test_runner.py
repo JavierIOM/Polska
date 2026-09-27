@@ -28,8 +28,8 @@ from polska.adapters.registry import AdapterRegistry
 from polska.budget import BudgetGuard
 from polska.config.appconfig import AppConfig
 from polska.config.company import CompanyProfile
-from polska.db.enums import AgentName, ApprovalStatus, RunStatus, TaskState
-from polska.db.models import Approval, Company, Run, Task
+from polska.db.enums import AgentName, ApprovalStatus, BudgetScope, RunStatus, TaskState
+from polska.db.models import Approval, BudgetHalt, Company, Run, Task
 from polska.runner import AgentRunner
 
 
@@ -692,13 +692,20 @@ async def test_exceeding_the_per_task_cost_ceiling_abandons_before_attempts_run_
 ) -> None:
     """max_attempts bounds retries, not spend. A task that costs more than
     max_usd_per_task must be abandoned even on its very first attempt, with
-    plenty of attempts still nominally available."""
+    plenty of attempts still nominally available.
+
+    max_usd_per_run is kept comfortably above the marketer's real fixed
+    prompt cost so the pre-dispatch input-size check (which measures the
+    actual system prompt, task prompt and schema before ever calling the
+    fake query_fn) lets the call through; it is the *actual* reported cost
+    below, not the estimate, that then blows through max_usd_per_task.
+    """
     tight = app_config.model_copy(
         update={
             "budget": app_config.budget.model_copy(
                 update={
-                    "max_usd_per_run": 0.001,
-                    "max_usd_per_task": 0.001,
+                    "max_usd_per_run": 0.01,
+                    "max_usd_per_task": 0.01,
                     "max_usd_per_day": 1.0,
                     "max_usd_per_company": 10.0,
                 }
@@ -707,8 +714,11 @@ async def test_exceeding_the_per_task_cost_ceiling_abandons_before_attempts_run_
     )
     guard = BudgetGuard(tight)
     output = {"succeeded": False, "summary": "Nope.", "failure_reason": "too expensive"}
-    # Costs $0.0021, well over the $0.001 task ceiling, on a single attempt.
-    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    # Costs $0.05, well over the $0.01 task ceiling, on a single attempt.
+    expensive_usage = {
+        "claude-sonnet-5": {"inputTokens": 500, "outputTokens": 100, "costUSD": 0.05}
+    }
+    result_msg = _result_message(structured_output=output, model_usage=expensive_usage)
     runner = AgentRunner(
         app_config=tight,
         budget_guard=guard,
@@ -731,3 +741,98 @@ async def test_exceeding_the_per_task_cost_ceiling_abandons_before_attempts_run_
     assert task.attempts < tight.limits.max_attempts
     assert task.state == TaskState.ABANDONED
     assert "cost" in task.result["abandoned_because"]
+
+
+# ------------------------------------------------------ mid-run budget watchdog
+
+
+async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
+    session,
+    app_config: AppConfig,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """The bug this closes: a run that reserved 200k tokens once spent 2.03M,
+    because nothing checked usage until the run had already finished. This proves
+    the watchdog fires mid-stream, not after: a third message that would push the
+    run further over is never even pulled from the stream."""
+    tight = app_config.model_copy(
+        update={"budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000})}
+    )
+    guard = BudgetGuard(tight)
+    pulled: list[str] = []
+
+    async def fake(*, prompt: str, options: object):
+        for label, tokens in [("first", 500), ("second", 600), ("third", 10)]:
+            pulled.append(label)
+            yield AssistantMessage(
+                content=[TextBlock(text=label)],
+                model="claude-sonnet-5",
+                usage={"input_tokens": tokens, "output_tokens": 0},
+            )
+
+    runner = AgentRunner(
+        app_config=tight,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=fake,
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is None
+    assert outcome.run.status == RunStatus.INTERRUPTED
+    assert "ceiling" in outcome.run.error
+    # The generator was closed right after "second" pushed the total over 1,000;
+    # "third" must never have been pulled at all.
+    assert pulled == ["first", "second"]
+    assert outcome.run.input_tokens == 1_100
+
+    halt = session.execute(
+        select(BudgetHalt).where(BudgetHalt.limit_name == "mid_run_watchdog")
+    ).scalar_one()
+    assert halt.scope == BudgetScope.RUN
+    assert halt.company_id == company.id
+
+
+async def test_the_pre_dispatch_check_refuses_without_ever_calling_the_sdk(
+    session,
+    app_config: AppConfig,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """Input size alone, known before dispatch, must be enough to refuse a call.
+    The fake query_fn here raises if it is ever invoked, so a passing test proves
+    the SDK was never reached."""
+    tight = app_config.model_copy(
+        update={"budget": app_config.budget.model_copy(update={"max_usd_per_run": 0.0001})}
+    )
+    guard = BudgetGuard(tight)
+
+    async def fake_that_must_not_be_called(*, prompt: str, options: object):
+        raise AssertionError("The SDK must not be called once the pre-dispatch check refuses.")
+        yield  # pragma: no cover - unreachable, makes this an async generator
+
+    runner = AgentRunner(
+        app_config=tight,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=fake_that_must_not_be_called,
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is None
+    assert outcome.run.status == RunStatus.BUDGET_BLOCKED
+    assert "Refused rather than dispatched" in outcome.run.error
+    assert outcome.run.cost_usd == 0.0
+
+    halt = session.execute(
+        select(BudgetHalt).where(BudgetHalt.limit_name == "pre_dispatch_input_size")
+    ).scalar_one()
+    assert halt.scope == BudgetScope.RUN
+    assert halt.observed_value > tight.budget.max_usd_per_run

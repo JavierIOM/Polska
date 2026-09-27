@@ -49,6 +49,12 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     BUDGET_BLOCKED = "budget_blocked"
+    #: Polska itself cut this run off mid-stream because it crossed its own token
+    #: or dollar ceiling before finishing. Real money was spent, unlike
+    #: BUDGET_BLOCKED (which never calls the SDK at all): distinguished from it
+    #: precisely so "we refused to start" and "we started and then stopped it
+    #: ourselves" are never conflated in the record. See AgentRunner._execute_and_record.
+    INTERRUPTED = "interrupted"
     #: The process that started this run died before it could record what happened.
     #: Real money may have been spent; actual usage is unknown. Never confused with
     #: FAILED, which means the run finished and we know why. Recovered at the next
