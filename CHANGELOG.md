@@ -5,6 +5,16 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-09-28
+
+### Changed
+
+- Analyst's `max_usd_per_run` reverted from $0.75 back to $1.00 on review: one
+  completed run (DVLA, the simplest of the six upstream sources) is a floor, not
+  a range. gov.im's scraper alone is ~2.5x DVLA's line count with real regex
+  parsing to read, and could plausibly cost double — headroom stays until three
+  or four sources have actually completed.
+
 ## [0.3.5] - 2026-09-27
 
 First clean, real, end-to-end task completion on CarScratch. A hand-written,

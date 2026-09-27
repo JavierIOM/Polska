@@ -164,18 +164,18 @@ agents:
     # The broad "map all 6 sources" task was cut off twice (223,194 tokens,
     # then 639,589 after the ceiling was tripled) before being abandoned in
     # favour of splitting it into one task per source (see fail_or_abandon and
-    # the wiki). A hand-written single-source task (DVLA only, the simplest of
-    # the six) then completed cleanly at 300,033 tokens / $0.22569: real
-    # confirmation that a properly-scoped analyst task fits well inside even
-    # the original 600k ceiling, and the binding constraint really is tokens,
-    # not dollars (cache_read/cache_write dominate over fresh input/output).
-    # max_tokens_per_run is left at 600,000: ~2x that one real completion, and
-    # the other five sources are untested, some plausibly heavier to read than
-    # DVLA. max_usd_per_run is tightened using the real rate this run measured:
-    # $0.22569 / 300,033 tokens = $0.7522/M. Projected out to the 600k ceiling,
-    # ~$0.4513; rounded up to leave real margin for a pricier source (less
-    # caching, more fresh output) without letting dollars bind before tokens.
-    max_usd_per_run: 0.75
+    # the wiki). A hand-written single-source task (DVLA only, the simplest
+    # source) then completed cleanly at 300,033 tokens / $0.22569.
+    #
+    # max_usd_per_run was briefly tightened to $0.75 from that one number, then
+    # put back to $1.00 on review: DVLA is the simplest of the sources (one
+    # small file, one silent-failure path), and one completed run gives a
+    # floor, not a range. gov.im's scraper alone is ~2.5x DVLA's line count
+    # with real regex parsing to read, and could plausibly cost double.
+    # Revisit with headroom once three or four sources have actually
+    # completed, not before. max_tokens_per_run stays at 600,000: ~2x the one
+    # real completion, untested against the heavier remaining sources.
+    max_usd_per_run: 1.00
     max_tokens_per_run: 600_000
 
 pricing:
