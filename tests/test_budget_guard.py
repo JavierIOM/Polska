@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from polska.budget import BudgetExceeded, BudgetGuard, active_halt, reconcile_orphaned_runs
 from polska.config.appconfig import AppConfig
-from polska.db.enums import BudgetScope, RunStatus
+from polska.db.enums import AgentName, BudgetScope, RunStatus
 from polska.db.models import Company, Run
 
 
@@ -50,7 +50,7 @@ def _run(
 ) -> Run:
     record = Run(
         company_id=company.id,
-        agent="analyst",
+        agent=AgentName.ANALYST,
         model="claude-sonnet-5",
         input_tokens=tokens,
         cost_usd=cost_usd,
@@ -86,7 +86,9 @@ async def test_a_reservation_within_budget_succeeds(
     session: Session, tight_config: AppConfig, company: Company
 ) -> None:
     guard = BudgetGuard(tight_config)
-    reservation = await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+    reservation = await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
     assert reservation.usd == tight_config.budget.max_usd_per_run
     assert reservation.company_id == company.id
 
@@ -96,10 +98,16 @@ async def test_reserving_past_the_daily_ceiling_is_refused(
 ) -> None:
     guard = BudgetGuard(tight_config)
     # Two reservations of $1 fit under $2.5. A third would bring the day to $3.
-    await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
-    await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+    await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
+    await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
     with pytest.raises(BudgetExceeded) as excinfo:
-        await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+        await guard.reserve(
+            session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
     assert excinfo.value.halt.limit_name == "max_usd_per_day"
     assert excinfo.value.halt.scope == BudgetScope.DAY
 
@@ -110,9 +118,13 @@ async def test_a_refused_reservation_writes_a_budget_halt(
     """The stop is recorded before it takes effect. This is what proves that."""
     guard = BudgetGuard(tight_config)
     for _ in range(2):
-        await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+        await guard.reserve(
+            session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
     with pytest.raises(BudgetExceeded):
-        await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+        await guard.reserve(
+            session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
 
     halt = active_halt(session, company.id)
     assert halt is not None
@@ -124,12 +136,18 @@ async def test_release_frees_the_reservation_for_reuse(
     session: Session, tight_config: AppConfig, company: Company
 ) -> None:
     guard = BudgetGuard(tight_config)
-    first = await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
-    second = await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+    first = await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
+    second = await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
     guard.release(first)
     guard.release(second)
     # Both released: a third reservation should not see any outstanding claim.
-    third = await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+    third = await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
     assert third.usd == 1.0
 
 
@@ -137,7 +155,9 @@ async def test_releasing_the_same_reservation_twice_is_harmless(
     session: Session, tight_config: AppConfig, company: Company
 ) -> None:
     guard = BudgetGuard(tight_config)
-    reservation = await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+    reservation = await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
     guard.release(reservation)
     guard.release(reservation)  # must not raise
 
@@ -162,7 +182,9 @@ async def test_an_active_halt_blocks_every_new_reservation_regardless_of_sums(
         reason="manually injected for the test",
     )
     with pytest.raises(BudgetExceeded):
-        await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+        await guard.reserve(
+            session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
 
 
 async def test_a_cleared_halt_no_longer_blocks(
@@ -185,7 +207,9 @@ async def test_a_cleared_halt_no_longer_blocks(
     halt.cleared_by = "javier"
     session.commit()
 
-    reservation = await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+    reservation = await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
     assert reservation is not None
 
 
@@ -209,7 +233,9 @@ async def test_a_global_halt_blocks_a_company_that_never_tripped_it(
         reason=f"tripped by {other.slug}",
     )
     with pytest.raises(BudgetExceeded):
-        await guard.reserve(session, company_id=victim.id, model="claude-sonnet-5")
+        await guard.reserve(
+            session, company_id=victim.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
 
 
 # --------------------------------------------------------------- the actual race
@@ -231,7 +257,12 @@ async def test_concurrent_reservations_cannot_together_exceed_the_ceiling(
     try:
         results = await asyncio.gather(
             *(
-                guard.reserve(sess, company_id=company.id, model="claude-sonnet-5")
+                guard.reserve(
+                    sess,
+                    company_id=company.id,
+                    model="claude-sonnet-5",
+                    agent_name=AgentName.SUPPORT,
+                )
                 for sess in sessions
             ),
             return_exceptions=True,
@@ -351,7 +382,9 @@ async def test_a_reservation_is_blocked_after_orphan_recovery_trips_a_halt(
 
     guard = BudgetGuard(tight_config)
     with pytest.raises(BudgetExceeded):
-        await guard.reserve(session, company_id=company.id, model="claude-sonnet-5")
+        await guard.reserve(
+            session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
 
 
 # ------------------------------------------------------------------------- write-off

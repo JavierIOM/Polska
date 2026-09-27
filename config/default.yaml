@@ -84,6 +84,12 @@ agents:
   # Model tiers set by Javier on 24 Sep 2026: Opus everywhere was the safe first
   # default, but not sustainable for a loop firing every 4 hours. Engineering is
   # the one job worth paying Opus rates for; everything else steps down.
+  # Per-agent max_usd_per_run / max_tokens_per_run, added 27 Sep 2026, sized from
+  # real measured runs, not guessed. Where an agent has no override below, it
+  # falls back to budget.max_usd_per_run / budget.max_tokens_per_run: that is a
+  # deliberate "no real usage data yet" choice for that agent, not an oversight.
+  # See AppConfig.max_usd_per_run_for / max_tokens_per_run_for, which every
+  # enforcement path resolves through.
   planner:
     model: claude-sonnet-5
     tools: []
@@ -91,6 +97,12 @@ agents:
     timeout_seconds: 300
     # A planning decision is closer to classification than open-ended reasoning.
     effort: low
+    # Observed 27 Sep: a real, successful planning cycle used 58,543 tokens and
+    # cost $0.10826. ~1.7x tokens and ~2.3x dollars of headroom over that,
+    # rounded to a clean figure: real room for a bigger plan, still nowhere
+    # near the 200k/$3.00 global default that assumes an open-ended worker.
+    max_usd_per_run: 0.25
+    max_tokens_per_run: 100_000
 
   dedup_judge:
     model: claude-haiku-4-5
@@ -101,6 +113,8 @@ agents:
     # unlike Sonnet/Opus tier models. Setting one would 400 every judge call.
     # Haiku's cost variance is already low since it gets no adaptive thinking
     # by default (only Sonnet/Opus tier think unless explicitly configured).
+    # No real usage data yet (never reached in either live dry run), so no
+    # override: inherits the global default rather than a guessed figure.
 
   engineer:
     model: claude-opus-5
@@ -109,6 +123,17 @@ agents:
     tools: [Read, Write, Edit, Glob, Grep, Bash]
     max_turns: 40
     timeout_seconds: 900
+    # No engineer run completed today (blocked before dispatch by the analyst's
+    # halt), so this is sized from the previous dry run's real numbers instead:
+    # two Opus-tier runs at 351k and 471k tokens, $0.64376 and $0.55168, neither
+    # a natural finish (both cut off externally by the account running out of
+    # credit). max_tokens_per_run is set to ~1.6x the larger of those two,
+    # genuine headroom beyond anything actually observed rather than a number
+    # that would have clipped either run again. max_usd_per_run projects the
+    # higher of the two observed $/token rates out to that same token ceiling
+    # and rounds up for margin.
+    max_usd_per_run: 2.00
+    max_tokens_per_run: 750_000
 
   marketer:
     model: claude-sonnet-5
@@ -116,6 +141,8 @@ agents:
     tools: [Read, Write, WebSearch]
     max_turns: 20
     timeout_seconds: 600
+    # No real usage data yet (never dispatched in either live dry run), so no
+    # override: inherits the global default rather than a guessed figure.
 
   support:
     model: claude-haiku-4-5
@@ -123,6 +150,9 @@ agents:
     tools: [Read, Grep]
     max_turns: 15
     timeout_seconds: 600
+    # No real usage data yet (never dispatched in either live dry run), so no
+    # override: inherits the global default rather than a guessed figure. On
+    # Haiku, with only Read/Grep, it should end up tight in practice regardless.
 
   analyst:
     model: claude-sonnet-5
@@ -130,6 +160,15 @@ agents:
     tools: [Read, Glob, Grep, WebSearch, WebFetch]
     max_turns: 25
     timeout_seconds: 600
+    # Observed 27 Sep: a real analyst run was still climbing when the new
+    # watchdog cut it off at 223,194 tokens / $0.24909 (mostly cache_read and
+    # cache_write from wide, repeated context, not fresh input/output), so the
+    # binding constraint here is tokens, not dollars. max_tokens_per_run is set
+    # to ~2.7x that cutoff point, real room to actually finish a comparably
+    # wide research task. max_usd_per_run projects the observed $/token rate
+    # out to that same token ceiling (~$0.67) and rounds up for margin.
+    max_usd_per_run: 1.00
+    max_tokens_per_run: 600_000
 
 pricing:
   # USD per million tokens. Input and output are list rates.

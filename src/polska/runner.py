@@ -183,20 +183,26 @@ class _RunningUsage:
             self.cost_usd(app_config, model),
         )
 
-    def exceeds(self, app_config: AppConfig, model: str) -> str | None:
-        """A human-readable reason the run has crossed its own ceiling, or ``None``."""
-        budget = app_config.budget
+    def exceeds(
+        self, app_config: AppConfig, model: str, *, max_tokens_per_run: int, max_usd_per_run: float
+    ) -> str | None:
+        """A human-readable reason the run has crossed its own ceiling, or ``None``.
+
+        ``max_tokens_per_run``/``max_usd_per_run`` are the caller's already-resolved
+        figures for this specific agent (see ``AppConfig.max_usd_per_run_for``), not
+        the bare global default: an engineer and a planner do not share a ceiling.
+        """
         tokens = self.total_tokens
-        if tokens > budget.max_tokens_per_run:
+        if tokens > max_tokens_per_run:
             return (
                 f"Cut off mid-stream: {tokens} tokens spent against a "
-                f"{budget.max_tokens_per_run} token run ceiling."
+                f"{max_tokens_per_run} token run ceiling."
             )
         cost = self.cost_usd(app_config, model)
-        if cost > budget.max_usd_per_run:
+        if cost > max_usd_per_run:
             return (
                 f"Cut off mid-stream: ${cost:.4f} spent against a "
-                f"${budget.max_usd_per_run:.2f} run ceiling."
+                f"${max_usd_per_run:.2f} run ceiling."
             )
         return None
 
@@ -410,7 +416,9 @@ class AgentRunner:
         model = agent_config.model
 
         try:
-            reservation = await self._budget.reserve(session, company_id=company_id, model=model)
+            reservation = await self._budget.reserve(
+                session, company_id=company_id, model=model, agent_name=agent_name
+            )
         except BudgetExceeded as exc:
             # Recorded as a Run, the same as any other outcome, rather than left as
             # a bare exception: "every ceiling crossing is recorded" means a row
@@ -511,6 +519,13 @@ class AgentRunner:
     ) -> tuple[Run, BaseModel | None]:
         system_prompt = build_system_prompt(agent_name, agent_config, company=company_profile)
         schema = schema_model.model_json_schema()
+        # Resolved once, here: this agent's own override if it has one, else the
+        # global default. Every check below (pre-dispatch, the SDK's own
+        # max_budget_usd, the mid-stream watchdog, the halt it writes) uses these
+        # same two numbers, so none of them can disagree about which ceiling
+        # applies to this run.
+        max_usd_per_run = self._config.max_usd_per_run_for(agent_name)
+        max_tokens_per_run = self._config.max_tokens_per_run_for(agent_name)
 
         # Measured before a single token is sent. This cannot see what a worker's
         # own tool calls will pull in later (that is what the mid-stream watchdog
@@ -528,6 +543,8 @@ class AgentRunner:
             user_prompt=user_prompt,
             schema=schema,
             started=started,
+            max_usd_per_run=max_usd_per_run,
+            max_tokens_per_run=max_tokens_per_run,
         )
         if blocked is not None:
             return blocked, None
@@ -549,7 +566,7 @@ class AgentRunner:
             # this figure before the SDK's own check caught it. The mid-stream
             # watchdog below is what actually holds the line; this is one more
             # layer, not the layer.
-            max_budget_usd=self._config.budget.max_usd_per_run,
+            max_budget_usd=max_usd_per_run,
             # SDK isolation mode. Left at its default (None), every call loads
             # ~/.claude/settings.json, any .claude/settings.json or
             # .claude/settings.local.json found from cwd, and CLAUDE.md: whoever's
@@ -601,7 +618,12 @@ class AgentRunner:
                         result_message = message
                     elif isinstance(message, AssistantMessage) and message.usage:
                         running.add(message.usage)
-                        overshoot = running.exceeds(self._config, model)
+                        overshoot = running.exceeds(
+                            self._config,
+                            model,
+                            max_tokens_per_run=max_tokens_per_run,
+                            max_usd_per_run=max_usd_per_run,
+                        )
                         if overshoot is not None:
                             # This is the fix for a real incident: a run spent
                             # 10x its reservation because nothing checked usage
@@ -649,6 +671,7 @@ class AgentRunner:
                 company_id=company_id,
                 run=run,
                 observed_value=running.cost_usd(self._config, model),
+                limit_value=max_usd_per_run,
                 limit_name="mid_run_watchdog",
                 reason=error_text or "Run interrupted after crossing its own ceiling mid-stream.",
             )
@@ -722,10 +745,13 @@ class AgentRunner:
         user_prompt: str,
         schema: dict[str, Any],
         started: Any,
+        max_usd_per_run: float,
+        max_tokens_per_run: int,
     ) -> Run | None:
         """Refuse to dispatch if the *known* input alone would already breach the
         run's ceiling. Returns a written, terminal ``Run`` row if it does, else
-        ``None`` to mean "fine, carry on"."""
+        ``None`` to mean "fine, carry on". ``max_usd_per_run``/``max_tokens_per_run``
+        are this agent's already-resolved figures, not the bare global default."""
         estimated_tokens = (
             _estimate_tokens(system_prompt)
             + _estimate_tokens(user_prompt)
@@ -733,17 +759,16 @@ class AgentRunner:
         )
         price = self._config.price_for(model)
         estimated_usd = price.cost_usd(input_tokens=estimated_tokens, output_tokens=0)
-        budget = self._config.budget
 
-        within_tokens = estimated_tokens <= budget.max_tokens_per_run
-        within_usd = estimated_usd <= budget.max_usd_per_run
+        within_tokens = estimated_tokens <= max_tokens_per_run
+        within_usd = estimated_usd <= max_usd_per_run
         if within_tokens and within_usd:
             return None
 
         reason = (
             f"Input alone is an estimated {estimated_tokens} tokens (~${estimated_usd:.4f} "
             f"at {model}'s input rate) before a single reply token: over the "
-            f"{budget.max_tokens_per_run} token / ${budget.max_usd_per_run:.2f} run ceiling "
+            f"{max_tokens_per_run} token / ${max_usd_per_run:.2f} run ceiling "
             "on the known, fixed part of the request alone. Refused rather than dispatched."
         )
         run = Run(
@@ -767,6 +792,7 @@ class AgentRunner:
             company_id=company_id,
             run=run,
             observed_value=estimated_usd,
+            limit_value=max_usd_per_run,
             limit_name="pre_dispatch_input_size",
             reason=reason,
         )
@@ -790,6 +816,7 @@ class AgentRunner:
         company_id: int,
         run: Run,
         observed_value: float,
+        limit_value: float,
         limit_name: str,
         reason: str,
     ) -> None:
@@ -798,7 +825,7 @@ class AgentRunner:
             company_id=company_id,
             scope=BudgetScope.RUN,
             limit_name=limit_name,
-            limit_value=self._config.budget.max_usd_per_run,
+            limit_value=limit_value,
             observed_value=observed_value,
             period_key=None,
             reason=f"Run {run.id}: {reason}",

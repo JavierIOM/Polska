@@ -93,6 +93,49 @@ def test_a_zero_fx_rate_is_refused() -> None:
         BudgetConfig(usd_to_gbp=0)
 
 
+def test_an_agent_with_no_override_falls_back_to_the_global_ceiling(
+    app_config: AppConfig,
+) -> None:
+    """No real usage data yet for this agent is exactly why it has no override."""
+    assert app_config.agents[AgentName.MARKETER].max_usd_per_run is None
+    assert app_config.max_usd_per_run_for(AgentName.MARKETER) == app_config.budget.max_usd_per_run
+    assert (
+        app_config.max_tokens_per_run_for(AgentName.MARKETER)
+        == app_config.budget.max_tokens_per_run
+    )
+
+
+def test_an_agent_override_wins_over_the_global_ceiling(app_config: AppConfig) -> None:
+    """The whole point: an agent with real data gets its own figure, not the
+    one-size-fits-all default every other agent still uses."""
+    before = app_config.max_usd_per_run_for(AgentName.SUPPORT)
+    tightened = app_config.model_copy(
+        update={
+            "agents": {
+                **app_config.agents,
+                AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
+                    update={"max_usd_per_run": 0.25, "max_tokens_per_run": 100_000}
+                ),
+            }
+        }
+    )
+    assert tightened.max_usd_per_run_for(AgentName.PLANNER) == 0.25
+    assert tightened.max_tokens_per_run_for(AgentName.PLANNER) == 100_000
+    # An unrelated agent is unaffected by the planner's override.
+    assert tightened.max_usd_per_run_for(AgentName.SUPPORT) == before
+
+
+def test_an_agent_override_above_the_task_ceiling_is_refused(app_config: AppConfig) -> None:
+    """The same relationship the global figure is checked against, applied per
+    agent: a single run priced above the whole task's ceiling could never
+    complete even one attempt. ``model_copy`` does not re-run validators, so this
+    goes through ``model_validate`` to actually exercise the check."""
+    dumped = app_config.model_dump()
+    dumped["agents"]["engineer"]["max_usd_per_run"] = app_config.budget.max_usd_per_task + 1
+    with pytest.raises(ValidationError, match="above budget.max_usd_per_task"):
+        AppConfig.model_validate(dumped)
+
+
 def test_pricing_maths(app_config: AppConfig) -> None:
     """One million input tokens on Opus 5 is five dollars, by the shipped rates."""
     price = app_config.price_for("claude-opus-5")

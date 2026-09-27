@@ -42,7 +42,7 @@ from sqlalchemy.orm import Session
 
 from polska.activity import log
 from polska.config.appconfig import AppConfig, BudgetConfig
-from polska.db.enums import ActivityKind, BudgetScope, RunStatus
+from polska.db.enums import ActivityKind, AgentName, BudgetScope, RunStatus
 from polska.db.models import BudgetHalt, Run
 from polska.db.types import utcday, utcnow
 
@@ -172,14 +172,19 @@ class BudgetGuard:
         """Dollars already claimed by other in-flight runs for this company."""
         return sum(r.usd for r in self._reservations.values() if r.company_id == company_id)
 
-    async def reserve(self, session: Session, *, company_id: int, model: str) -> Reservation:
+    async def reserve(
+        self, session: Session, *, company_id: int, model: str, agent_name: AgentName
+    ) -> Reservation:
         """Claim one run's worth of budget, or raise :class:`BudgetExceeded`.
 
-        The claim is always ``max_usd_per_run`` in full: not priced from the model
-        or from an assumed token count, because there is no reliable upper bound on
-        input tokens before a run starts (a tool-heavy agent can pull far more input
-        than it ever emits as output), and the configured dollar ceiling is the one
-        figure both this reservation and the SDK's own ``max_budget_usd`` agree on.
+        The claim is always this agent's ``max_usd_per_run`` in full (its own
+        override if it has one, else the global default, resolved through
+        ``AppConfig.max_usd_per_run_for`` the same way every other enforcement path
+        does): not priced from the model or from an assumed token count, because
+        there is no reliable upper bound on input tokens before a run starts (a
+        tool-heavy agent can pull far more input than it ever emits as output), and
+        the configured dollar ceiling is the one figure both this reservation and
+        the SDK's own ``max_budget_usd`` agree on.
         """
         async with self._lock:
             existing = active_halt(session, company_id)
@@ -187,7 +192,7 @@ class BudgetGuard:
                 raise BudgetExceeded(existing)
 
             today = utcday()
-            run_usd = self.budget.max_usd_per_run
+            run_usd = self._config.max_usd_per_run_for(agent_name)
 
             day_usd = (
                 _actual_usd(session, company_id, since_day=today)
@@ -262,39 +267,41 @@ class BudgetGuard:
         compounding on the next run.
         """
         halts: list[BudgetHalt] = []
+        max_usd = self._config.max_usd_per_run_for(run.agent)
+        max_tokens = self._config.max_tokens_per_run_for(run.agent)
 
-        if run.cost_usd > self.budget.max_usd_per_run:
+        if run.cost_usd > max_usd:
             halts.append(
                 write_halt(
                     session,
                     company_id=company_id,
                     scope=BudgetScope.RUN,
                     limit_name="max_usd_per_run",
-                    limit_value=self.budget.max_usd_per_run,
+                    limit_value=max_usd,
                     observed_value=run.cost_usd,
                     period_key=None,
                     reason=(
-                        f"Run {run.id} cost ${run.cost_usd:.4f} against a reservation "
-                        f"of ${self.budget.max_usd_per_run:.2f}. max_budget_usd was "
-                        "passed to the SDK for this exact figure; this means that "
-                        "enforcement did not hold, not that the ceiling does not apply."
+                        f"Run {run.id} ({run.agent.value}) cost ${run.cost_usd:.4f} against "
+                        f"a reservation of ${max_usd:.2f}. max_budget_usd was passed to the "
+                        "SDK for this exact figure; this means that enforcement did not "
+                        "hold, not that the ceiling does not apply."
                     ),
                 )
             )
 
-        if run.total_tokens > self.budget.max_tokens_per_run:
+        if run.total_tokens > max_tokens:
             halts.append(
                 write_halt(
                     session,
                     company_id=company_id,
                     scope=BudgetScope.RUN,
                     limit_name="max_tokens_per_run",
-                    limit_value=self.budget.max_tokens_per_run,
+                    limit_value=max_tokens,
                     observed_value=run.total_tokens,
                     period_key=None,
                     reason=(
-                        f"Run {run.id} used {run.total_tokens} tokens against a "
-                        f"same-model safety net of {self.budget.max_tokens_per_run}."
+                        f"Run {run.id} ({run.agent.value}) used {run.total_tokens} tokens "
+                        f"against a same-model safety net of {max_tokens}."
                     ),
                 )
             )
@@ -331,11 +338,13 @@ def reconcile_orphaned_runs(session: Session, app_config: AppConfig) -> list[Run
         return []
 
     now = utcnow()
-    worst_case = app_config.budget.max_usd_per_run
     fx_rate = app_config.budget.usd_to_gbp
     affected_companies: set[int] = set()
 
     for run in orphans:
+        # Resolved per run, not once for the whole batch: two orphans can belong
+        # to different agents, each with its own reservation figure.
+        worst_case = app_config.max_usd_per_run_for(run.agent)
         run.status = RunStatus.ORPHANED
         run.cost_usd = worst_case
         run.cost_gbp = worst_case * fx_rate

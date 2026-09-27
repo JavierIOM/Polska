@@ -176,6 +176,17 @@ class AgentConfig(BaseModel):
     #: more than "low"; a worker actually doing the task is left alone unless
     #: there is a specific reason to change it.
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    #: This agent's own per-run ceilings, overriding ``budget.max_usd_per_run`` /
+    #: ``budget.max_tokens_per_run`` for every call it makes. None means "no
+    #: override, use the global figure": a deliberate choice for an agent nobody
+    #: has real usage data for yet, rather than a guessed number. See
+    #: ``AppConfig.max_usd_per_run_for`` / ``max_tokens_per_run_for``, which every
+    #: enforcement path (reservation, the SDK's own max_budget_usd, the mid-stream
+    #: watchdog, the pre-dispatch check, the post-hoc overshoot check, and orphan
+    #: write-off pricing) resolves through, so they can never disagree about which
+    #: figure applies to this agent.
+    max_usd_per_run: float | None = Field(default=None, gt=0)
+    max_tokens_per_run: int | None = Field(default=None, ge=1)
 
 
 class ApprovalConfig(BaseModel):
@@ -294,6 +305,39 @@ class AppConfig(BaseModel):
                 "for, so this is refused rather than assumed to be free."
             )
         return self
+
+    @model_validator(mode="after")
+    def _no_agent_override_exceeds_the_task_ceiling(self) -> Self:
+        """The same relationship ``BudgetConfig`` already enforces for the global
+        figure, checked again for every agent-specific override: a single run
+        priced above what a whole task is allowed to spend could never complete
+        even one attempt."""
+        for name, agent in self.agents.items():
+            if (
+                agent.max_usd_per_run is not None
+                and agent.max_usd_per_run > self.budget.max_usd_per_task
+            ):
+                raise ValueError(
+                    f"{name.value}'s max_usd_per_run (${agent.max_usd_per_run:.2f}) is "
+                    f"above budget.max_usd_per_task (${self.budget.max_usd_per_task:.2f})."
+                )
+        return self
+
+    def max_usd_per_run_for(self, agent_name: AgentName) -> float:
+        """This agent's per-run dollar ceiling: its own override if it has one,
+        else the global default. Every enforcement path (the reservation, the
+        SDK's own ``max_budget_usd``, the mid-stream watchdog, the pre-dispatch
+        check, the post-hoc overshoot check, and orphan write-off pricing)
+        resolves through this, so none of them can disagree about which figure
+        applies to a given run.
+        """
+        override = self.agents[agent_name].max_usd_per_run
+        return override if override is not None else self.budget.max_usd_per_run
+
+    def max_tokens_per_run_for(self, agent_name: AgentName) -> int:
+        """This agent's per-run token ceiling. See :meth:`max_usd_per_run_for`."""
+        override = self.agents[agent_name].max_tokens_per_run
+        return override if override is not None else self.budget.max_tokens_per_run
 
     def price_for(self, model: str) -> ModelPricing:
         """Pricing for ``model``, or a clear failure."""

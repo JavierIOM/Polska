@@ -11,7 +11,14 @@ perform a real external effect.
 Usage, from the repo root, with the package installed editable (`pip install -e .`,
 already true for anyone who has run the test suite):
 
-    .venv\\Scripts\\python.exe scripts\\observe_ticks.py <company-slug> [num-ticks]
+    .venv\\Scripts\\python.exe scripts\\observe_ticks.py <company-slug> [num-ticks] \\
+        [--max-concurrent N] [--stop-if-over USD]
+
+``--max-concurrent`` overrides ``limits.max_concurrent_tasks`` for this invocation
+only; the config file on disk is untouched. ``--stop-if-over`` checks cumulative
+spend after each tick and stops before starting the next one if it has already been
+exceeded, so a session with a real dollar cap can't blow through it unattended
+between ticks.
 
 Runs against the real database named in settings (``data/polska.db`` by default),
 not a throwaway one: a tick's history matters to the next tick's dedup, so this is
@@ -20,8 +27,8 @@ meant to accumulate state across runs the same way the real scheduler would.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import sys
 from pathlib import Path
 
 from sqlalchemy import select
@@ -39,9 +46,24 @@ from polska.runner import AgentRunner
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-async def main(slug: str, num_ticks: int) -> None:
+async def main(
+    slug: str,
+    num_ticks: int,
+    *,
+    max_concurrent: int | None = None,
+    stop_if_over: float | None = None,
+) -> None:
     settings = load_settings()
     app_config = load_app_config(settings.config_path)
+    if max_concurrent is not None:
+        app_config = app_config.model_copy(
+            update={
+                "limits": app_config.limits.model_copy(
+                    update={"max_concurrent_tasks": max_concurrent}
+                )
+            }
+        )
+        print(f"max_concurrent_tasks overridden to {max_concurrent} for this run only")
     print(f"force_dry_run = {app_config.integrations.force_dry_run}")
     if not app_config.integrations.force_dry_run:
         print("WARNING: force_dry_run is false. A real adapter call could have a real effect.")
@@ -119,13 +141,28 @@ async def main(slug: str, num_ticks: int) -> None:
                 if task.dedup_note:
                     print(f"      dedup: {task.dedup_note}")
 
+        if stop_if_over is not None and grand_total > stop_if_over:
+            print(
+                f"\n{'=' * 70}\nSTOPPED: spent ${grand_total:.5f}, over the ${stop_if_over:.2f} "
+                f"cap, after tick {tick_num}/{num_ticks}. Not starting another tick.\n{'=' * 70}"
+            )
+            return
+
     print(f"\n{'=' * 70}\nDONE: {num_ticks} tick(s), ${grand_total:.5f} total\n{'=' * 70}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: observe_ticks.py <company-slug> [num-ticks]")
-        raise SystemExit(1)
-    company_slug = sys.argv[1]
-    ticks = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-    asyncio.run(main(company_slug, ticks))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("company_slug")
+    parser.add_argument("num_ticks", type=int, nargs="?", default=3)
+    parser.add_argument("--max-concurrent", type=int, default=None)
+    parser.add_argument("--stop-if-over", type=float, default=None)
+    args = parser.parse_args()
+    asyncio.run(
+        main(
+            args.company_slug,
+            args.num_ticks,
+            max_concurrent=args.max_concurrent,
+            stop_if_over=args.stop_if_over,
+        )
+    )

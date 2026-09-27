@@ -755,9 +755,21 @@ async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     """The bug this closes: a run that reserved 200k tokens once spent 2.03M,
     because nothing checked usage until the run had already finished. This proves
     the watchdog fires mid-stream, not after: a third message that would push the
-    run further over is never even pulled from the stream."""
+    run further over is never even pulled from the stream.
+
+    The planner's own per-agent override is cleared here so this test exercises
+    the global figure specifically, regardless of what default.yaml ships for the
+    planner (see the separate per-agent-override test for that)."""
     tight = app_config.model_copy(
-        update={"budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000})}
+        update={
+            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000}),
+            "agents": {
+                **app_config.agents,
+                AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
+                    update={"max_usd_per_run": None, "max_tokens_per_run": None}
+                ),
+            },
+        }
     )
     guard = BudgetGuard(tight)
     pulled: list[str] = []
@@ -797,6 +809,54 @@ async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     assert halt.company_id == company.id
 
 
+async def test_a_per_agent_ceiling_override_is_what_the_watchdog_actually_checks(
+    session,
+    app_config: AppConfig,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """The global max_tokens_per_run is left untouched and is nowhere near being
+    crossed by this sequence. Only the planner's own override (1,000) is tight
+    enough to cut it off, proving the watchdog reads the per-agent figure rather
+    than always falling back to the global default."""
+    overridden = app_config.model_copy(
+        update={
+            "agents": {
+                **app_config.agents,
+                AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
+                    update={"max_tokens_per_run": 1_000}
+                ),
+            }
+        }
+    )
+    assert overridden.budget.max_tokens_per_run > 1_000  # the global figure is untouched
+    guard = BudgetGuard(overridden)
+    pulled: list[str] = []
+
+    async def fake(*, prompt: str, options: object):
+        for label, tokens in [("first", 500), ("second", 600), ("third", 10)]:
+            pulled.append(label)
+            yield AssistantMessage(
+                content=[TextBlock(text=label)],
+                model="claude-sonnet-5",
+                usage={"input_tokens": tokens, "output_tokens": 0},
+            )
+
+    runner = AgentRunner(
+        app_config=overridden,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=fake,
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.run.status == RunStatus.INTERRUPTED
+    assert pulled == ["first", "second"]
+
+
 async def test_the_watchdog_does_not_fire_on_a_run_that_stays_at_or_under_its_ceiling(
     session,
     app_config: AppConfig,
@@ -807,9 +867,21 @@ async def test_the_watchdog_does_not_fire_on_a_run_that_stays_at_or_under_its_ce
     all. Accumulated usage lands exactly ON the token ceiling (not over it) after
     the second message, deliberately testing the boundary rather than a
     comfortably-clear case, then the run finishes normally: every message must
-    still be pulled, the run must succeed, and no watchdog halt is written."""
+    still be pulled, the run must succeed, and no watchdog halt is written.
+
+    The planner's own per-agent override is cleared here so this test exercises
+    the global figure specifically, regardless of what default.yaml ships for the
+    planner."""
     tight = app_config.model_copy(
-        update={"budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000})}
+        update={
+            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000}),
+            "agents": {
+                **app_config.agents,
+                AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
+                    update={"max_usd_per_run": None, "max_tokens_per_run": None}
+                ),
+            },
+        }
     )
     guard = BudgetGuard(tight)
     pulled: list[str] = []
@@ -858,9 +930,21 @@ async def test_the_pre_dispatch_check_refuses_without_ever_calling_the_sdk(
 ) -> None:
     """Input size alone, known before dispatch, must be enough to refuse a call.
     The fake query_fn here raises if it is ever invoked, so a passing test proves
-    the SDK was never reached."""
+    the SDK was never reached.
+
+    The planner's own per-agent override is cleared here so this test exercises
+    the global figure specifically, regardless of what default.yaml ships for the
+    planner."""
     tight = app_config.model_copy(
-        update={"budget": app_config.budget.model_copy(update={"max_usd_per_run": 0.0001})}
+        update={
+            "budget": app_config.budget.model_copy(update={"max_usd_per_run": 0.0001}),
+            "agents": {
+                **app_config.agents,
+                AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
+                    update={"max_usd_per_run": None, "max_tokens_per_run": None}
+                ),
+            },
+        }
     )
     guard = BudgetGuard(tight)
 

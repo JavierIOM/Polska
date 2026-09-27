@@ -5,6 +5,46 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-09-27
+
+Per-agent budget ceilings, sized from real measured runs rather than guessed. The
+first live rerun with credit restored also confirmed the mid-run watchdog live: it
+correctly cut off a real analyst run at 223,194 tokens, and correctly left a real
+planner run alone at 58,543 tokens in the same tick.
+
+### Added
+
+- `AgentConfig.max_usd_per_run` / `max_tokens_per_run`, both `None` by default
+  ("no override, use the global figure" — a deliberate choice for an agent nobody
+  has real usage data for yet, not a guessed number).
+- `AppConfig.max_usd_per_run_for(agent_name)` / `max_tokens_per_run_for(agent_name)`:
+  the one place every enforcement path (the reservation, the SDK's own
+  `max_budget_usd`, the mid-stream watchdog, the pre-dispatch check, the post-hoc
+  overshoot check, and orphan write-off pricing) resolves an agent's effective
+  ceiling, so none of them can disagree about which figure applies to a run.
+- A validator: no agent's `max_usd_per_run` override may exceed
+  `budget.max_usd_per_task`, mirroring the existing check on the global figure.
+- Real overrides in `config/default.yaml`: planner tightened to $0.25 / 100,000
+  tokens (observed: a real successful run used 58,543 tokens, $0.10826); analyst
+  loosened to $1.00 / 600,000 tokens (observed: a real run was still climbing when
+  cut off at 223,194 tokens, $0.24909 — the binding constraint is tokens, not
+  dollars, because caching makes tokens cheap); engineer loosened to $2.00 /
+  750,000 tokens (no engineer run completed today, so sized from the previous dry
+  run's real 351k/471k-token, $0.644/$0.552 runs instead). Dedup judge, marketer
+  and support get no override: no real usage data for any of them yet.
+- `scripts/observe_ticks.py --max-concurrent N` and `--stop-if-over USD`: override
+  `limits.max_concurrent_tasks` for one invocation without touching the config
+  file, and stop before starting another tick once cumulative spend has been
+  exceeded, so a session with a real dollar cap can't blow through it unattended.
+
+### Fixed
+
+- `BudgetGuard.reserve` reserved a flat `max_usd_per_run` regardless of which
+  agent was calling; it now takes `agent_name` and resolves that agent's own
+  figure. `check_run_did_not_overshoot` and `reconcile_orphaned_runs` priced every
+  run against the same flat global figure regardless of agent; both now resolve
+  per run.
+
 ## [0.3.2] - 2026-09-27
 
 The budget guard was bookkeeping, not control: `max_budget_usd` reached the SDK but
