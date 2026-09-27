@@ -160,14 +160,22 @@ agents:
     tools: [Read, Glob, Grep, WebSearch, WebFetch]
     max_turns: 25
     timeout_seconds: 600
-    # Observed 27 Sep: a real analyst run was still climbing when the new
-    # watchdog cut it off at 223,194 tokens / $0.24909 (mostly cache_read and
-    # cache_write from wide, repeated context, not fresh input/output), so the
-    # binding constraint here is tokens, not dollars. max_tokens_per_run is set
-    # to ~2.7x that cutoff point, real room to actually finish a comparably
-    # wide research task. max_usd_per_run projects the observed $/token rate
-    # out to that same token ceiling (~$0.67) and rounds up for margin.
-    max_usd_per_run: 1.00
+    # Updated 27 Sep after a real natural completion, not just cutoff points.
+    # The broad "map all 6 sources" task was cut off twice (223,194 tokens,
+    # then 639,589 after the ceiling was tripled) before being abandoned in
+    # favour of splitting it into one task per source (see fail_or_abandon and
+    # the wiki). A hand-written single-source task (DVLA only, the simplest of
+    # the six) then completed cleanly at 300,033 tokens / $0.22569: real
+    # confirmation that a properly-scoped analyst task fits well inside even
+    # the original 600k ceiling, and the binding constraint really is tokens,
+    # not dollars (cache_read/cache_write dominate over fresh input/output).
+    # max_tokens_per_run is left at 600,000: ~2x that one real completion, and
+    # the other five sources are untested, some plausibly heavier to read than
+    # DVLA. max_usd_per_run is tightened using the real rate this run measured:
+    # $0.22569 / 300,033 tokens = $0.7522/M. Projected out to the 600k ceiling,
+    # ~$0.4513; rounded up to leave real margin for a pricier source (less
+    # caching, more fresh output) without letting dollars bind before tokens.
+    max_usd_per_run: 0.75
     max_tokens_per_run: 600_000
 
 pricing:

@@ -5,6 +5,27 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-09-27
+
+First clean, real, end-to-end task completion on CarScratch. A hand-written,
+single-source version of the task that twice blew its ceiling at broad scope
+("map the 6 upstream data sources") completed on the first real attempt once an
+unrelated leftover halt was cleared: 300,033 tokens, $0.22569, a genuine
+verifiable proposal (a structured log line for DVLA's silent-failure mode).
+
+### Changed
+
+- Analyst's `max_usd_per_run` tightened from $1.00 to $0.75, using the real rate
+  this completion measured ($0.22569 / 300,033 tokens = $0.7522/M) projected out
+  to the existing 600,000-token ceiling (~$0.45), rounded up for margin against a
+  pricier, less-cached source among the other five. `max_tokens_per_run` is left
+  at 600,000: real headroom (~2x this completion) that the other five sources
+  have not yet tested.
+- `tests/test_budget_guard.py`'s `tight_config` fixture now clears every agent's
+  own per-run override, not just the global figures: several of its tests were
+  silently relying on no agent having one, which broke the moment analyst got a
+  real override earlier today.
+
 ## [0.3.4] - 2026-09-27
 
 Found rerunning today's tripled analyst ceiling and still hitting it: a task

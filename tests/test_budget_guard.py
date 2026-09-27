@@ -65,7 +65,11 @@ def _run(
 
 @pytest.fixture
 def tight_config(app_config: AppConfig) -> AppConfig:
-    """A config with a dollar ceiling low enough to hit in a couple of small runs."""
+    """A config with a dollar ceiling low enough to hit in a couple of small runs.
+
+    Every agent's own per-run override is cleared so every test in this file can
+    assume the global figures above are what actually apply, regardless of which
+    agents default.yaml happens to give their own override to."""
     return app_config.model_copy(
         update={
             "budget": app_config.budget.model_copy(
@@ -74,7 +78,11 @@ def tight_config(app_config: AppConfig) -> AppConfig:
                     "max_usd_per_day": 2.5,
                     "max_usd_per_company": 100.0,
                 }
-            )
+            ),
+            "agents": {
+                name: agent.model_copy(update={"max_usd_per_run": None, "max_tokens_per_run": None})
+                for name, agent in app_config.agents.items()
+            },
         }
     )
 
