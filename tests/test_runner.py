@@ -746,6 +746,58 @@ async def test_exceeding_the_per_task_cost_ceiling_abandons_before_attempts_run_
 # ------------------------------------------------------ mid-run budget watchdog
 
 
+async def test_an_interrupted_run_is_abandoned_not_requeued_at_identical_scope(
+    session,
+    app_config: AppConfig,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """The leak this closes: a task that is genuinely too big for one run was
+    coming back as ``failed`` and getting requeued at the exact same scope, up to
+    two more times, burning budget each time before max_attempts finally caught
+    up with it. On its very first attempt, with attempts and task budget both
+    nowhere near exhausted, a mid-stream cutoff must abandon it outright.
+
+    max_tokens_per_run is set above the marketer's own fixed-prompt estimate
+    (~1,037 tokens for this profile) so the pre-dispatch check passes and the
+    fake stream's usage is what trips the mid-stream watchdog instead — this
+    test is specifically about the INTERRUPTED path, not BUDGET_BLOCKED."""
+    tight = app_config.model_copy(
+        update={"budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_500})}
+    )
+    guard = BudgetGuard(tight)
+
+    async def fake(*, prompt: str, options: object):
+        yield AssistantMessage(
+            content=[TextBlock(text="reading...")],
+            model="claude-sonnet-5",
+            usage={"input_tokens": 2_000, "output_tokens": 0},
+        )
+
+    runner = AgentRunner(
+        app_config=tight,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=fake,
+    )
+
+    assert task.attempts == 0
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft something.",
+    )
+
+    session.refresh(task)
+    assert task.attempts == 1  # nowhere near max_attempts
+    assert task.state == TaskState.ABANDONED
+    assert task.result["needs_rescoping"] is True
+    assert "run ceiling" in task.result["abandoned_because"]
+
+
 async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     session,
     app_config: AppConfig,

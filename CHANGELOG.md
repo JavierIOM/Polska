@@ -5,6 +5,27 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-09-27
+
+Found rerunning today's tripled analyst ceiling and still hitting it: a task
+that fails because it genuinely crossed its own run ceiling was coming back as
+`failed` and getting requeued at identical scope by the ordinary retry path,
+burning budget on repeat attempts that were always going to fail the same way,
+before `max_attempts` finally caught up with it. The planner itself noticed this
+exact problem independently in the same tick and recommended holding for
+narrower scoping — this fix makes the mechanical retry path agree with it.
+
+### Fixed
+
+- `AgentRunner.fail_or_abandon` takes an optional `run_status`. A task whose run
+  ended `RunStatus.INTERRUPTED` is now abandoned immediately, regardless of
+  attempts or cumulative cost remaining, with `needs_rescoping: true` in its
+  result — never requeued unchanged. Deliberately does *not* extend this to
+  `RunStatus.BUDGET_BLOCKED`: that status also covers a run blocked by an
+  unrelated, already-open company halt, which says nothing about whether this
+  particular task is too big, and treating the two alike would abandon a
+  perfectly reasonable task for someone else's overshoot.
+
 ## [0.3.3] - 2026-09-27
 
 Per-agent budget ceilings, sized from real measured runs rather than guessed. The

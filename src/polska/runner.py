@@ -307,12 +307,17 @@ class AgentRunner:
         result = outcome.output
         if not isinstance(result, AgentResult):
             self.fail_or_abandon(
-                session, task, outcome.run.error or "The agent's output did not validate."
+                session,
+                task,
+                outcome.run.error or "The agent's output did not validate.",
+                run_status=outcome.run.status,
             )
             return outcome
 
         if not result.succeeded:
-            self.fail_or_abandon(session, task, result.failure_reason)
+            self.fail_or_abandon(
+                session, task, result.failure_reason, run_status=outcome.run.status
+            )
             return outcome
 
         any_pending = False
@@ -337,10 +342,17 @@ class AgentRunner:
         session.commit()
         return outcome
 
-    def fail_or_abandon(self, session: Session, task: Task, reason: str) -> None:
+    def fail_or_abandon(
+        self,
+        session: Session,
+        task: Task,
+        reason: str,
+        *,
+        run_status: RunStatus | None = None,
+    ) -> None:
         """Move a task out of ``running`` after a failure, to ``failed`` if it may
         still be retried, or to ``abandoned`` if it has run out of either attempts
-        or budget.
+        or budget, or was cut off for crossing its own run ceiling.
 
         Without this, a task that exhausts ``limits.max_attempts`` would sit in
         ``failed`` forever, and ``failed`` suppresses a fresh planner proposal for
@@ -350,11 +362,28 @@ class AgentRunner:
         the dedup rules never suppress, or the underlying need goes quiet with
         nothing left that will ever try it again.
 
-        Two independent reasons can exhaust a task, checked separately because they
-        measure different things: ``limits.max_attempts`` bounds retries, and
-        ``budget.max_usd_per_task`` bounds spend. A task can hit the cost ceiling
-        with attempts still available, on an expensive model, and it must not be
-        allowed one more attempt just because the attempt counter has room left.
+        Three independent reasons can exhaust a task, checked separately because
+        they measure different things:
+
+        - ``limits.max_attempts`` bounds retries.
+        - ``budget.max_usd_per_task`` bounds cumulative spend. A task can hit the
+          cost ceiling with attempts still available, on an expensive model, and it
+          must not be allowed one more attempt just because the attempt counter
+          has room left.
+        - ``run_status is RunStatus.INTERRUPTED``: the mid-stream watchdog cut this
+          run off for crossing its own ceiling while it ran, on its very first
+          attempt if that is when it happened. That is not a substantive failure
+          worth retrying unchanged: the task itself is too big for one run, and
+          requeuing it at identical scope would just burn the same ceiling again,
+          attempt after attempt, until ``max_attempts`` finally caught up with it.
+          Deliberately narrower than ``RunStatus.BUDGET_BLOCKED`` here: a blocked
+          run can mean this task's own input was too big (a real "too big" signal,
+          same as INTERRUPTED) or it can mean the *company* is halted for a reason
+          that has nothing to do with this task's size at all (an unrelated open
+          halt, a day or company ceiling) — conflating the two would abandon a
+          perfectly reasonable task for someone else's overshoot. Only the
+          unambiguous case is handled automatically; the rest stays ``failed`` and
+          the ordinary retry/backoff path decides what happens next.
 
         ``failed`` itself is not requeued here: whether and when to retry a failed
         task is a scheduling decision (capacity, backoff) that belongs to the
@@ -363,18 +392,21 @@ class AgentRunner:
         attempts_exhausted = task.attempts >= self._config.limits.max_attempts
         spent = actual_usd_for_task(session, task.id)
         budget_exhausted = spent >= self._config.budget.max_usd_per_task
+        ceiling_exceeded = run_status is RunStatus.INTERRUPTED
 
-        if attempts_exhausted or budget_exhausted:
-            why = (
-                f"attempts ({task.attempts}/{self._config.limits.max_attempts})"
-                if attempts_exhausted
-                else f"cost (${spent:.4f}/${self._config.budget.max_usd_per_task:.2f})"
-            )
+        if attempts_exhausted or budget_exhausted or ceiling_exceeded:
+            if ceiling_exceeded:
+                why = "exceeded its own run ceiling; needs narrower scope before retrying"
+            elif attempts_exhausted:
+                why = f"attempts ({task.attempts}/{self._config.limits.max_attempts})"
+            else:
+                why = f"cost (${spent:.4f}/${self._config.budget.max_usd_per_task:.2f})"
             task.transition_to(
                 TaskState.ABANDONED,
                 result={
                     "abandoned_reason": reason,
                     "abandoned_because": why,
+                    "needs_rescoping": ceiling_exceeded,
                     "attempts": task.attempts,
                     "max_attempts": self._config.limits.max_attempts,
                     "spent_usd": spent,
