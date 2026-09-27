@@ -5,6 +5,31 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-09-28
+
+Found running the single-source spread test: the mid-stream watchdog can close
+the stream on the exact same message that carried the model's own valid,
+complete answer, throwing away real finished work and wrongly abandoning a
+task that had, in fact, succeeded. Confirmed on a real run (MOT's silent-failure
+audit): the CLI's internal `StructuredOutput` tool call, sitting right there in
+`tools_called`, validated cleanly against `AgentResult` after the fact, but
+nothing was looking at it.
+
+### Fixed
+
+- `AgentRunner._recover_structured_output`: when a run ends with no
+  `ResultMessage` (`INTERRUPTED` or `TIMED_OUT`), scans `tools_called`
+  backwards for the CLI's own terminal output tool call and validates it
+  against the task's schema. The `Run` row still honestly records
+  `INTERRUPTED`/`TIMED_OUT` (the SDK call really was cut off, and any
+  `BudgetHalt` it wrote still stands), but `run_worker` decides a task's fate
+  from the validated output, not from `run.status`, so a task that actually
+  finished is no longer thrown away and abandoned for it.
+- Task #5 (CarScratch, MOT audit) manually corrected: its run had already
+  produced a valid answer before today's fix existed. Left `abandoned` (a
+  terminal state, not reopened) with the recovered answer annotated onto its
+  result for anyone reviewing it.
+
 ## [0.3.6] - 2026-09-28
 
 ### Changed

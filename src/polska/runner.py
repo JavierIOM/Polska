@@ -138,6 +138,43 @@ def _extract_usage(
     return 0, 0, 0, 0, 0.0
 
 
+#: The CLI's own internal tool name for handing back --json-schema output. Not
+#: exposed as an importable constant anywhere in the SDK; confirmed by directly
+#: inspecting tools_called on a real run whose stream was cut off right after
+#: this exact tool call.
+_STRUCTURED_OUTPUT_TOOL_NAME = "StructuredOutput"
+
+
+def _recover_structured_output(
+    tools_called: list[dict[str, Any]], schema_model: type[BaseModel]
+) -> tuple[Any, BaseModel] | None:
+    """The model's own last valid answer, if the stream was cut off before the
+    CLI could turn it into a proper ``ResultMessage``.
+
+    This is the fix for a real incident: the mid-stream watchdog closed the
+    stream on the exact same message that carried a fully valid ``AgentResult``
+    for a task that had, in fact, finished -- and nothing was looking at
+    ``tools_called`` to notice, so a real, paid-for answer was thrown away and
+    the task wrongly abandoned. Scans backwards so a run that called the output
+    tool more than once (the model retrying its own earlier, invalid attempt)
+    recovers the LAST one, matching what ``ResultMessage.structured_output``
+    would have held had the stream been allowed to finish naturally.
+    """
+    for call in reversed(tools_called):
+        if call.get("name") != _STRUCTURED_OUTPUT_TOOL_NAME:
+            continue
+        raw = call.get("input", {}).get("input")
+        if not isinstance(raw, str):
+            continue
+        try:
+            structured = json.loads(raw)
+            validated = schema_model.model_validate(structured)
+        except (ValueError, ValidationError):
+            continue
+        return structured, validated
+    return None
+
+
 class _RunningUsage:
     """Usage accumulated live, one ``AssistantMessage`` at a time.
 
@@ -728,6 +765,21 @@ class AgentRunner:
 
         if raw_output is None and text_parts:
             raw_output = "".join(text_parts)
+
+        if result_message is None and status in (RunStatus.INTERRUPTED, RunStatus.TIMED_OUT):
+            # The Run row still honestly records that the SDK call itself was cut
+            # off (status stays INTERRUPTED/TIMED_OUT, the halt above still stands):
+            # this only changes whether the TASK is wrongly abandoned for work it
+            # had, in fact, already finished. run_worker decides the task's fate
+            # from `validated`, not from `run.status`, so setting this is what
+            # lets a recovered task proceed as done instead.
+            recovered = _recover_structured_output(tools_called, schema_model)
+            if recovered is not None:
+                structured, validated = recovered
+                error_text = (
+                    f"{error_text} Recovered a valid structured output from before "
+                    "the cutoff; the task is not abandoned for this."
+                )
 
         if status == RunStatus.RUNNING:
             try:

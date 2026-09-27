@@ -798,6 +798,64 @@ async def test_an_interrupted_run_is_abandoned_not_requeued_at_identical_scope(
     assert "run ceiling" in task.result["abandoned_because"]
 
 
+async def test_a_cutoff_run_recovers_a_valid_answer_the_model_already_gave(
+    session,
+    app_config: AppConfig,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """The bug this closes, found live: a real run's watchdog fired on the exact
+    same message that carried a fully valid AgentResult for a task that had, in
+    fact, already finished, and the task was wrongly abandoned for it. The Run
+    row must still honestly say INTERRUPTED (the SDK call really was cut off,
+    and the halt still stands), but the task itself must not be thrown away."""
+    tight = app_config.model_copy(
+        update={
+            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000}),
+            "agents": {
+                **app_config.agents,
+                AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
+                    update={"max_usd_per_run": None, "max_tokens_per_run": None}
+                ),
+            },
+        }
+    )
+    guard = BudgetGuard(tight)
+    valid_answer = '{"tasks": [], "no_action_reason": "Nothing new since last cycle."}'
+
+    async def fake(*, prompt: str, options: object):
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(id="tu_1", name="StructuredOutput", input={"input": valid_answer})
+            ],
+            model="claude-sonnet-5",
+            usage={"input_tokens": 2_000, "output_tokens": 0},
+        )
+
+    runner = AgentRunner(
+        app_config=tight,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=fake,
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.run.status == RunStatus.INTERRUPTED
+    assert "Recovered a valid structured output" in outcome.run.error
+    assert outcome.output is not None
+    assert outcome.output.is_empty
+
+    # The halt from the genuine overshoot still stands: recovering the answer
+    # is not a reason to also relax the budget control that caught it.
+    halt = session.execute(
+        select(BudgetHalt).where(BudgetHalt.limit_name == "mid_run_watchdog")
+    ).scalar_one()
+    assert halt.scope == BudgetScope.RUN
+
+
 async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     session,
     app_config: AppConfig,
