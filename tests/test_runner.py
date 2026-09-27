@@ -797,6 +797,59 @@ async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     assert halt.company_id == company.id
 
 
+async def test_the_watchdog_does_not_fire_on_a_run_that_stays_at_or_under_its_ceiling(
+    session,
+    app_config: AppConfig,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    """A guard that fires when it shouldn't is as bad as one that doesn't fire at
+    all. Accumulated usage lands exactly ON the token ceiling (not over it) after
+    the second message, deliberately testing the boundary rather than a
+    comfortably-clear case, then the run finishes normally: every message must
+    still be pulled, the run must succeed, and no watchdog halt is written."""
+    tight = app_config.model_copy(
+        update={"budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000})}
+    )
+    guard = BudgetGuard(tight)
+    pulled: list[str] = []
+    output = {"tasks": [], "no_action_reason": "Nothing new since last cycle."}
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+
+    async def fake(*, prompt: str, options: object):
+        for label, tokens in [("first", 500), ("second", 500)]:
+            pulled.append(label)
+            yield AssistantMessage(
+                content=[TextBlock(text=label)],
+                model="claude-sonnet-5",
+                usage={"input_tokens": tokens, "output_tokens": 0},
+            )
+        pulled.append("result")
+        yield result_msg
+
+    runner = AgentRunner(
+        app_config=tight,
+        budget_guard=guard,
+        adapter_registry=registry,
+        query_fn=fake,
+    )
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert pulled == ["first", "second", "result"]
+    assert outcome.run.status == RunStatus.SUCCEEDED
+    assert outcome.output is not None
+
+    halt_count = (
+        session.execute(select(BudgetHalt).where(BudgetHalt.limit_name == "mid_run_watchdog"))
+        .scalars()
+        .all()
+    )
+    assert halt_count == []
+
+
 async def test_the_pre_dispatch_check_refuses_without_ever_calling_the_sdk(
     session,
     app_config: AppConfig,

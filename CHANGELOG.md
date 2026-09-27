@@ -32,6 +32,10 @@ no credit right now.
   stream and stops pulling further messages the instant the ceiling is crossed; the
   other proves the fake `query_fn` is never invoked when the pre-dispatch check
   refuses.
+- A third test proving the negative case Javier asked for explicitly: a run whose
+  accumulated usage lands exactly ON the token ceiling (not over it), then finishes
+  normally, must pull every message, succeed, and write no watchdog halt. A guard
+  that fires when it shouldn't is as bad as one that doesn't fire.
 
 ### Changed
 
