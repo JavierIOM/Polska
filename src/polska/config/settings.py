@@ -11,21 +11,38 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-#: Correct for an editable install (``pip install -e .``, true in dev and in
-#: CI): ``__file__`` then resolves inside the real source tree, three parents
-#: up from this file. A non-editable install (the Docker image) copies the
-#: package into site-packages instead, where this would resolve to somewhere
-#: under site-packages, not the repo. That never actually bites: every field
-#: below that uses this is also named in .env.example with a relative path
-#: (resolved against the process's cwd, which the Dockerfile sets to /app),
-#: and .env always wins over this default. It would only bite something that
-#: read REPO_ROOT directly rather than through a Settings field, and nothing
-#: does.
-REPO_ROOT = Path(__file__).resolve().parents[3]
-
 
 class Settings(BaseSettings):
-    """Environment-provided configuration."""
+    """Environment-provided configuration.
+
+    ``database_url``, ``config_path``, ``companies_dir`` and ``workspace_root``
+    default to plain paths relative to the process's current working
+    directory, not to this file's own location. That is deliberate, found the
+    hard way: an earlier version derived these from ``Path(__file__)``, which
+    is only meaningful for an editable install (``pip install -e .``, true in
+    dev and in CI) where ``__file__`` resolves inside the real source tree. A
+    non-editable install -- exactly what the Docker image does with
+    ``pip install ".[runtime]"`` -- copies the package into site-packages
+    instead, where that same computation lands under
+    ``/usr/local/lib/python3.12/`` or similar: a real path, just the wrong
+    one, so it fails silently at the point something tries to read a file
+    there rather than at settings-construction time. It surfaced as
+    ``load_app_config`` raising ``FileNotFoundError`` for
+    ``.../python3.12/config/default.yaml``, with no clue from the error alone
+    that the cause was an install-mode difference three modules away.
+
+    Relative-to-cwd is the fix, not a per-container hardcoded absolute path,
+    because it is the one resolution strategy that is already correct in both
+    real invocation contexts this project has: ``python -m polska.main`` (or
+    ``.dashboard.server``, or ``.cli``) run from the repo root in dev, and the
+    same commands run with ``WORKDIR /app`` in the container, where
+    ``docker-compose.yml`` bind-mounts ``config/``, ``companies/`` and
+    ``data/`` at exactly that path. Every env var below can still override
+    these explicitly (see ``.env.example``) and ``docker-compose.yml``'s
+    services still set them for clarity, but correctness no longer depends on
+    that: the same relative default resolves right either way, with or
+    without ``.env`` populated.
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -39,10 +56,10 @@ class Settings(BaseSettings):
         default=SecretStr(""), validation_alias="ANTHROPIC_API_KEY"
     )
 
-    database_url: str = f"sqlite+pysqlite:///{(REPO_ROOT / 'data' / 'polska.db').as_posix()}"
-    config_path: Path = REPO_ROOT / "config" / "default.yaml"
-    companies_dir: Path = REPO_ROOT / "companies"
-    workspace_root: Path = REPO_ROOT / "data" / "workspaces"
+    database_url: str = "sqlite+pysqlite:///data/polska.db"
+    config_path: Path = Path("config/default.yaml")
+    companies_dir: Path = Path("companies")
+    workspace_root: Path = Path("data/workspaces")
 
     #: Dashboard auth. Argon2 hash, never a plaintext password.
     admin_password_hash: SecretStr = SecretStr("")

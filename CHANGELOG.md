@@ -5,6 +5,41 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-09-28
+
+Found on the first real `docker compose build` (both containers crash-looped on
+startup): `Settings.config_path`/`companies_dir`/`workspace_root`/`database_url`
+defaulted to a path derived from `Path(__file__).resolve().parents[3]`, correct
+only for an editable install. The non-editable install the Docker image
+actually does copies the package into site-packages, where that computation
+lands under `/usr/local/lib/python3.12/` instead of the repo — surfaced as
+`load_app_config` raising `FileNotFoundError` for
+`/usr/local/lib/python3.12/config/default.yaml`. `migrations/env.py` inherits
+the same bug through `database_url`.
+
+### Fixed
+
+- Those four `Settings` fields now default to plain paths relative to the
+  process's current working directory, not to this module's own location.
+  That is the one resolution strategy already correct in both real contexts
+  this project has (repo root in dev, `WORKDIR /app` in the container, where
+  `docker-compose.yml` bind-mounts `config/`/`companies/`/`data/` at exactly
+  that path) — correct with or without `.env` populated, rather than
+  depending on every path env var reaching the container intact. `.env`'s
+  explicit values still override these; they are just no longer load-bearing
+  for basic correctness.
+- Audited every other path resolution for the same class of bug:
+  `dashboard/app.py`'s template directory correctly uses a `__file__`-relative
+  path (verified by building a real wheel and checking the 5 template files
+  are actually packaged); `workspace_root` inside `workspace.py` is a passed
+  parameter, not an independent computation; `scripts/observe_ticks.py`'s own
+  `REPO_ROOT` is a dev-only tool always run from the repo root, unaffected.
+- Verified the fix directly, not just reasoned about it: simulated the exact
+  container conditions locally (empty environment, `config`/`companies`/`data`
+  laid out under a directory playing `/app`) and confirmed both
+  `load_app_config` and `alembic upgrade head` now resolve correctly with zero
+  `POLSKA_*` env vars set at all.
+
 ## [0.4.0] - 2026-09-28
 
 Phase 4: the dashboard, plus a first pass at real deployment (Docker Compose for
