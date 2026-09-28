@@ -19,6 +19,7 @@ from polska.config.appconfig import load_app_config
 from polska.config.settings import load_settings
 from polska.dashboard.app import create_app
 from polska.db.base import make_engine, make_session_factory
+from polska.db.schema_check import assert_schema_is_current
 
 
 def build_app():
@@ -26,6 +27,10 @@ def build_app():
     logging.basicConfig(level=settings.log_level)
     app_config = load_app_config(settings.config_path)
     engine = make_engine(settings.database_url, echo=settings.sql_echo)
+    # Before anything else touches the database: a schema behind head must
+    # stop this process outright, not run degraded until a page queries the
+    # difference. See schema_check.py for the incident this closes.
+    assert_schema_is_current(engine)
     session_factory = make_session_factory(engine)
     return create_app(
         settings=settings,

@@ -23,6 +23,7 @@ from polska.config.company import discover_profiles, load_company_profile
 from polska.config.settings import load_settings
 from polska.dashboard.security import hash_password
 from polska.db.base import make_engine, make_session_factory
+from polska.db.schema_check import assert_schema_is_current
 from polska.orchestrator import run_company_tick, run_startup_recovery
 from polska.runner import AgentRunner
 
@@ -51,9 +52,24 @@ def _init_auth() -> None:
     password_hash = hash_password(password)
     session_secret = secrets.token_urlsafe(32)
 
-    print("\nAdd these to your .env (never to a tracked file):\n")
-    print(f"POLSKA_ADMIN_PASSWORD_HASH={password_hash}")
-    print(f"POLSKA_SESSION_SECRET={session_secret}")
+    # Single-quoted, deliberately: an Argon2 hash contains literal $ characters
+    # ($argon2id$v=19$m=...$salt$hash), and Docker Compose's .env parsing
+    # interpolates $ as a variable reference in an unquoted or double-quoted
+    # value (confirmed against Compose's own env_file docs), silently mangling
+    # the hash into whatever the referenced variable happens to expand to
+    # (usually nothing) -- a login that then cannot work, with no error
+    # anywhere to say why. Single quotes make Compose (and python-dotenv, for
+    # a non-Docker .env) take the value literally instead; verified against
+    # both. The session secret never contains $, but it costs nothing to quote
+    # it the same way for consistency.
+    print("\nAdd these to your .env (never to a tracked file). Keep the quotes: they")
+    print("stop Docker Compose from misreading the $ characters in the hash as")
+    print("variable references, which would silently corrupt it.\n")
+    print(f"POLSKA_ADMIN_PASSWORD_HASH='{password_hash}'")
+    print(f"POLSKA_SESSION_SECRET='{session_secret}'")
+    print("\nAfter editing .env, verify it landed correctly rather than assuming it did:")
+    print("  docker compose run --rm scheduler env | grep POLSKA_ADMIN_PASSWORD_HASH")
+    print("and compare it character-for-character against what was printed above.")
 
 
 async def _tick(slug: str | None) -> None:
@@ -63,6 +79,7 @@ async def _tick(slug: str | None) -> None:
     settings = load_settings()
     app_config = load_app_config(settings.config_path)
     engine = make_engine(settings.database_url, echo=settings.sql_echo)
+    assert_schema_is_current(engine)
     session_factory = make_session_factory(engine)
 
     run_startup_recovery(session_factory, app_config)

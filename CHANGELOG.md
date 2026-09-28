@@ -5,6 +5,36 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-09-28
+
+Two more found running the real deployment.
+
+### Fixed
+
+- `polska.cli init-auth` printed the Argon2 hash unquoted. Docker Compose's
+  `.env` parsing interpolates `$` as a variable reference in an unquoted or
+  double-quoted value (confirmed against Compose's own `env_file` docs), and
+  an Argon2 hash is full of literal `$` (`$argon2id$v=19$m=...$salt$hash`) —
+  silently mangling it into whatever the referenced variable expands to
+  (usually nothing), with no error anywhere to say why the login stopped
+  working. Now prints both the hash and the session secret single-quoted,
+  which Compose's docs confirm is taken literally, verified against both
+  Compose's `env_file:` parsing and python-dotenv (used for a non-Docker
+  `.env`) — and prints the `docker compose run --rm scheduler env | grep`
+  command to verify it landed correctly rather than assuming it did.
+- Nothing checked the database's schema against migrations at startup. A
+  database copied forward from a previous version let both containers start
+  clean; only the dashboard failed, and only once it happened to query a
+  column that did not exist yet — the scheduler would have ticked against the
+  same stale schema in 24 hours, whatever that failure looked like.
+  `polska.db.schema_check.assert_schema_is_current`, called at the top of
+  `main.py`, `dashboard/server.py` and `cli.py`'s `tick` command, now refuses
+  to start at all when the database's alembic revision does not match the
+  migrations' head, naming both revisions and the exact command to fix it.
+  Deliberately does not auto-migrate: this project's own rule is that
+  `alembic upgrade head` stays a separate, human-run step; the fix for silent
+  staleness is to fail loudly and immediately, not to remove the step.
+
 ## [0.4.1] - 2026-09-28
 
 Found on the first real `docker compose build` (both containers crash-looped on

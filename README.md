@@ -316,21 +316,34 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
    and `POLSKA_SESSION_SECRET` blank for now; the next steps generate them.
 
 4. **Build the image and run the database migrations** (a deliberate, separate step;
-   nothing here or in the app auto-migrates on boot):
+   nothing here or in the app auto-migrates on boot, and both `polska.main` and
+   `polska.dashboard.server` refuse to start at all against a database whose schema
+   is behind head, rather than run degraded and fail later on whatever code path
+   first touches the difference):
    ```
    docker compose build
    docker compose run --rm scheduler alembic upgrade head
    ```
+   Copying a database forward from an older deployment? Run this migration step
+   before anything else touches it, same as a fresh one.
 
 5. **Generate the dashboard's admin credentials.** This is a command you run, not a
    value anyone hands you: it prompts for a password (never echoed, never taken as a
    command-line argument, never logged) and prints an Argon2 hash plus a fresh random
-   session secret.
+   session secret, **each already single-quoted**.
    ```
    docker compose run --rm scheduler python -m polska.cli init-auth
    ```
-   Paste the two printed lines (`POLSKA_ADMIN_PASSWORD_HASH=...`,
-   `POLSKA_SESSION_SECRET=...`) into `.env`.
+   Paste the two printed lines into `.env` exactly as printed, quotes included: an
+   Argon2 hash contains literal `$` characters (`$argon2id$v=19$...`), and Compose's
+   `.env` parsing treats an unquoted or double-quoted `$` as a variable reference,
+   silently mangling the hash into whatever that (usually nonexistent) variable
+   expands to. Single quotes make Compose take the value literally. Verify it landed
+   correctly rather than assuming it did:
+   ```
+   docker compose run --rm scheduler env | grep POLSKA_ADMIN_PASSWORD_HASH
+   ```
+   and compare it character-for-character against what `init-auth` printed.
 
 6. **Start both containers:**
    ```

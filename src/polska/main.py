@@ -26,6 +26,7 @@ from polska.config.appconfig import AppConfig, load_app_config
 from polska.config.company import discover_profiles, load_company_profile
 from polska.config.settings import load_settings
 from polska.db.base import make_engine, make_session_factory
+from polska.db.schema_check import assert_schema_is_current
 from polska.orchestrator import run_company_tick, run_startup_recovery
 from polska.runner import AgentRunner
 
@@ -80,6 +81,10 @@ async def main() -> None:
 
     app_config = load_app_config(settings.config_path)
     engine = make_engine(settings.database_url, echo=settings.sql_echo)
+    # Before anything else touches the database: a schema behind head must
+    # stop this process outright, not run degraded until something happens to
+    # query the difference. See schema_check.py for the incident this closes.
+    assert_schema_is_current(engine)
     session_factory = make_session_factory(engine)
 
     run_startup_recovery(session_factory, app_config)

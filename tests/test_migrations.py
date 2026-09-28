@@ -16,6 +16,7 @@ from sqlalchemy import Engine, inspect
 
 import polska.db.models  # noqa: F401  (registers the tables)
 from polska.db.base import Base, make_engine
+from polska.db.schema_check import SchemaOutOfDate, assert_schema_is_current
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -75,3 +76,38 @@ def test_the_connection_runs_in_wal_with_foreign_keys_on(migrated_engine: Engine
         foreign_keys = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
     assert journal == "wal"
     assert foreign_keys == 1
+
+
+# ------------------------------------------------------------------- schema_check
+
+
+def test_a_fully_migrated_database_passes(migrated_engine: Engine) -> None:
+    assert_schema_is_current(migrated_engine, alembic_ini_path=REPO_ROOT / "alembic.ini")
+
+
+def test_a_database_one_revision_behind_head_is_refused(tmp_path: Path) -> None:
+    """The exact incident this closes: a database copied forward from an older
+    version, one migration short of head, must stop the process outright."""
+    db = tmp_path / "stale.db"
+    url = f"sqlite+pysqlite:///{db.as_posix()}"
+
+    config = Config(str(REPO_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    config.cmd_opts = Namespace(x=[f"url={url}"])
+    command.upgrade(config, "3ef3f8649043")  # one revision short of head
+
+    stale_engine = make_engine(url)
+    with pytest.raises(SchemaOutOfDate, match="not at the migrations' head"):
+        assert_schema_is_current(stale_engine, alembic_ini_path=REPO_ROOT / "alembic.ini")
+
+
+def test_a_database_with_no_migrations_applied_at_all_is_refused(tmp_path: Path) -> None:
+    """create_all builds every table but never touches alembic_version. The
+    rest of the suite uses exactly this to build its databases fast; this
+    process's own real entrypoints must not be fooled by the same shortcut."""
+    db = tmp_path / "never_migrated.db"
+    engine = make_engine(f"sqlite+pysqlite:///{db.as_posix()}")
+    Base.metadata.create_all(engine)
+
+    with pytest.raises(SchemaOutOfDate):
+        assert_schema_is_current(engine, alembic_ini_path=REPO_ROOT / "alembic.ini")
