@@ -22,6 +22,7 @@ from polska.db.enums import ActivityKind, TaskState, TaskType
 from polska.db.models import ActivityEvent, Company, Goal, Task
 from polska.db.types import utcnow
 from polska.orchestrator import (
+    _build_worker_prompt,
     is_retry_eligible,
     retry_delay_seconds,
     run_company_tick,
@@ -48,6 +49,50 @@ def test_retry_delay_is_capped() -> None:
         retry_base_delay_seconds=900, retry_backoff_multiplier=2.0, retry_max_delay_seconds=1000
     )
     assert retry_delay_seconds(3, limits) == 1000
+
+
+# ---------------------------------------------------------------- worker prompt
+
+
+def test_the_worker_prompt_includes_the_goal_s_own_description(session, company: Company) -> None:
+    """Found live: an analyst task burned real tokens hunting the repo for a
+    goal's definition that structurally cannot exist there. An agent's
+    workspace is a read-only repo clone; a Goal's own description lives in the
+    database and the company profile, neither of which the agent can otherwise
+    ever see. This proves it reaches the prompt, not just the title and numbers
+    already there."""
+    goal = Goal(
+        company_id=company.id,
+        key="upstream-monitoring",
+        title="Detect upstream data-source breakage before a user reports it",
+        description=(
+            "Chrystals auction data is deliberately excluded from this goal's count: "
+            "it makes no network call, so it has no live-request failure mode, and its "
+            "staleness risk is already tracked by auction-data-freshness."
+        ),
+        metric="monitored_data_sources",
+        target_value=5,
+        current_value=3,
+        unit="sources",
+    )
+    session.add(goal)
+    session.flush()
+    task = Task(
+        company_id=company.id,
+        goal_id=goal.id,
+        type=TaskType.RESEARCH,
+        title="Confirm Chrystals auction data is static",
+        description="Read chrystals.ts and confirm it makes no network call.",
+        rationale="Scoping check.",
+    )
+    session.add(task)
+    session.commit()
+
+    prompt = _build_worker_prompt(task, goal)
+
+    assert "auction-data-freshness" in prompt
+    assert "deliberately excluded" in prompt
+    assert "3/5 sources" in prompt  # the numbers are still there too
 
 
 def test_a_non_failed_task_is_never_retry_eligible(task: Task) -> None:

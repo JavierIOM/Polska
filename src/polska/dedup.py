@@ -51,12 +51,33 @@ def _normalize(text: str) -> str:
 
 
 def _proposal_key(proposal: ProposedTask) -> str:
-    return f"{proposal.type.value}:{_normalize(proposal.goal_key)}:{_normalize(proposal.title)}"
+    """The string ``_best_match`` fuzzy-compares two tasks by.
+
+    Includes the description, not just the title, because titles for the same
+    kind of work are naturally templated ("Document X's silent-failure mode and
+    propose a detection signal") and that shared boilerplate can swamp the one
+    or two words that actually distinguish the subject. Found live: a real "MOT"
+    proposal scored 96 against a completed "DVLA" task on title alone (94 on
+    title in isolation), well past ``high_threshold``, purely because eight of
+    nine title tokens were the template; their descriptions, which actually name
+    the different files and APIs involved, scored 53 against each other.
+    Folding the description in moves a case like that from "confidently and
+    silently dropped" into the ambiguous band, where the judge actually looks at
+    it, rather than trying to force it all the way down to "confidently kept"
+    by reweighting further and risking real duplicates slipping through instead.
+    """
+    return (
+        f"{proposal.type.value}:{_normalize(proposal.goal_key)}:"
+        f"{_normalize(proposal.title)} {_normalize(proposal.description)}"
+    )
 
 
 def _candidate_key(task: Task) -> str:
     goal_key = task.goal.key if task.goal is not None else ""
-    return f"{task.type.value}:{_normalize(goal_key)}:{_normalize(task.title)}"
+    return (
+        f"{task.type.value}:{_normalize(goal_key)}:"
+        f"{_normalize(task.title)} {_normalize(task.description)}"
+    )
 
 
 def _candidates(session: Session, company_id: int, config: DedupConfig) -> list[Task]:

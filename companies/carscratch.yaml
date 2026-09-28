@@ -91,18 +91,26 @@ goals:
   - key: upstream-monitoring
     title: Detect upstream data-source breakage before a user reports it
     description: >
-      The site depends on six external data sources (DVLA vehicle and tax data,
-      MOT history, gov.im for Isle of Man plates, and the CheckCarDetails scrape
-      behind the ScraperAPI/scrape.do proxy chain, among others), every one of
-      which can fail silently: a missing MOT_CLIENT_ID or DVLA_API_KEY falls back
-      to mock data with no visible error, and a broken proxy chain just returns
-      nothing. Right now breakage is found from a user complaint, or not at all.
-      This is pure observability: identify each source's failure mode and propose
-      a way to detect it (a health check, a log line that can be alerted on, a
-      status page, whatever fits) without touching how any source is actually
-      fetched. Nothing about this goal permits editing a scraper's request logic.
+      The site depends on five live external data sources (DVLA vehicle and tax
+      data, MOT history, gov.im for Isle of Man plates, and the CheckCarDetails
+      scrape behind the ScraperAPI/scrape.do proxy chain), every one of which can
+      fail silently: a missing MOT_CLIENT_ID or DVLA_API_KEY falls back to mock
+      data with no visible error, and a broken proxy chain just returns nothing.
+      Right now breakage is found from a user complaint, or not at all. This is
+      pure observability: identify each source's failure mode and propose a way
+      to detect it (a health check, a log line that can be alerted on, a status
+      page, whatever fits) without touching how any source is actually fetched.
+      Nothing about this goal permits editing a scraper's request logic.
+      Chrystals auction data (src/lib/chrystals.ts) was originally counted as a
+      sixth source but is deliberately excluded: confirmed 28 Sep 2026 that it
+      makes no network call at all, it is a pre-generated JSON file read at
+      import time, so it has no live-request failure mode to detect here. Its
+      only real risk is the file going stale, which is already this profile's
+      separate auction-data-freshness goal. Do not re-add it to this goal's
+      count; if its own goal is ever judged insufficient, that is a decision
+      about auction-data-freshness, not about this one.
     metric: monitored_data_sources
-    target: 6
+    target: 5
     current: 0
     unit: sources
     priority: 20

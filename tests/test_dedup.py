@@ -47,6 +47,7 @@ def _task(
     *,
     title: str,
     state: TaskState,
+    description: str = "",
     created_at: dt.datetime | None = None,
 ) -> Task:
     task = Task(
@@ -54,7 +55,7 @@ def _task(
         goal_id=goal.id,
         type=TaskType.MARKETING,
         title=title,
-        description="",
+        description=description,
         rationale="",
         state=state,
     )
@@ -138,6 +139,78 @@ async def test_a_proposal_with_no_candidates_is_kept(
     )
     assert decisions[0].keep
     assert "No comparable" in decisions[0].dedup_note
+
+
+async def test_a_templated_title_collision_no_longer_silently_drops(
+    session: Session, company: Company, runner: AgentRunner
+) -> None:
+    """Found live: two tasks about completely different upstream sources, whose
+    titles both followed the same "Document X's silent-failure mode and propose
+    a detection signal" template, scored 96 on title alone and were auto-dropped
+    without the judge ever seeing the MOT proposal. Their descriptions actually
+    name the different files and APIs involved (dvla.ts/DVLA_API_KEY vs
+    mot.ts/MOT_CLIENT_ID) and score nowhere near as high, so folding the
+    description into the match key must pull this out of auto-drop territory
+    -- kept here because the fixture's judge call fails and an ambiguous score
+    with no usable verdict defaults to kept, exactly as it should: not silently
+    dropped either way."""
+    goal = _goal(session, company)
+    _task(
+        session,
+        company,
+        goal,
+        title="Document DVLA's silent-failure mode and propose a detection signal",
+        description=(
+            "The DVLA vehicle/tax lookup (src/lib/dvla.ts) checks for a single "
+            "DVLA_API_KEY and logs a console.warn then returns null if it is unset."
+        ),
+        state=TaskState.DONE,
+    )
+    proposal = _proposal(
+        title="Document MOT history's silent-failure mode and propose a detection signal",
+        description=(
+            "The MOT history lookup (src/lib/mot.ts, getMOTHistory) uses OAuth2 "
+            "client-credentials (MOT_CLIENT_ID, MOT_CLIENT_SECRET, MOT_API_KEY) with a "
+            "cached access token, distinct from DVLA's single DVLA_API_KEY."
+        ),
+    )
+    decisions = await deduplicate(
+        session, runner, company_id=company.id, config=_dedup_config(), proposals=[proposal]
+    )
+    assert decisions[0].keep
+    assert "high_threshold" not in decisions[0].dedup_note
+
+
+async def test_a_genuine_duplicate_with_matching_description_still_auto_drops(
+    session: Session, company: Company, runner: AgentRunner
+) -> None:
+    """The fix for the templated-title collision above must not overcorrect into
+    never auto-dropping anything: a proposal for the *same* source, described the
+    same way, should still score high enough to suppress without a judge call."""
+    goal = _goal(session, company)
+    _task(
+        session,
+        company,
+        goal,
+        title="Document DVLA's silent-failure mode and propose a detection signal",
+        description=(
+            "The DVLA vehicle/tax lookup (src/lib/dvla.ts) checks for a single "
+            "DVLA_API_KEY and logs a console.warn then returns null if it is unset."
+        ),
+        state=TaskState.QUEUED,
+    )
+    proposal = _proposal(
+        title="Document DVLA's silent-failure mode and propose a detection signal",
+        description=(
+            "The DVLA vehicle/tax lookup (src/lib/dvla.ts) checks for a single "
+            "DVLA_API_KEY and logs a console.warn then returns null if it is unset."
+        ),
+    )
+    decisions = await deduplicate(
+        session, runner, company_id=company.id, config=_dedup_config(), proposals=[proposal]
+    )
+    assert not decisions[0].keep
+    assert "high_threshold" in decisions[0].dedup_note
 
 
 async def test_a_clearly_different_proposal_is_kept_as_novel(

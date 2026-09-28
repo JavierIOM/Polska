@@ -159,9 +159,18 @@ def _build_worker_prompt(task: Task, goal: Goal | None) -> str:
     if task.rationale:
         parts.append(f"\nWhy this task exists: {task.rationale}")
     if goal is not None:
+        # The goal's own description, not just its title and numbers: an agent's
+        # workspace is a read-only repo clone, which has no way to see the
+        # company profile a goal is defined in. Found live: an analyst task
+        # burned real tokens hunting the repo for another goal's definition,
+        # which structurally cannot exist there -- it lives in this project's
+        # own database and companies/*.yaml, invisible from inside the company's
+        # own repo. Any agent working toward a goal needs that goal's text
+        # handed to it here; it has no other way to ever see it.
         parts.append(
-            f"\nThis serves the goal '{goal.title}': currently {goal.current_value:g}/"
-            f"{goal.target_value:g} {goal.unit}."
+            f"\nThis serves the goal '{goal.title}' "
+            f"(currently {goal.current_value:g}/{goal.target_value:g} {goal.unit}):"
+            f"\n{goal.description or '(no further description given)'}"
         )
     return "\n".join(parts)
 

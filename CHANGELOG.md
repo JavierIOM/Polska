@@ -5,6 +5,42 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-09-28
+
+Four fixes from reviewing the single-source spread test's results.
+
+### Changed
+
+- Analyst's `max_tokens_per_run` raised from 600,000 to 900,000: two of five
+  single-source tasks hit 600k on legitimate work, not runaway exploration.
+  Catching 40% of normal tasks meant the ceiling was wrong, not the tasks.
+  `max_usd_per_run` stays at $1.00 as the real backstop, since tokens bind
+  first for this cache-heavy agent.
+- CarScratch's `upstream-monitoring` goal target changed from 6 to 5.
+  `chrystals.ts` makes no network call (a pre-generated JSON file, not a live
+  source) and its staleness risk is already `auction-data-freshness`'s job;
+  the reason is now in the profile's own description so nobody re-adds it.
+
+### Fixed
+
+- Dedup's fuzzy match key now includes each task's description, not just its
+  title. Found live: a new "MOT" proposal scored 96 against a completed
+  "DVLA" task on title alone (both followed the same "Document X's
+  silent-failure mode..." template) and was auto-dropped without the judge
+  ever seeing it. Their descriptions, which actually name the different files
+  and APIs, score 53 against each other; folding them in moves a case like
+  that into the ambiguous band instead of confidently and silently dropping
+  it. Chosen over lowering `high_threshold`: a 96 score needs the threshold
+  dropped drastically to catch, which would send far more genuinely-duplicate
+  proposals to the judge too, not just templated-title collisions.
+- `_build_worker_prompt` now includes the goal's own description, not just its
+  title and progress numbers. Found live: an analyst task burned real tokens
+  hunting a repo-only workspace for another goal's definition, which
+  structurally cannot exist there — a goal lives in the database and the
+  company profile, neither visible to an agent whose workspace is a read-only
+  repo clone. Any agent working toward a goal now gets that goal's text
+  handed to it at dispatch, since it has no other way to ever see it.
+
 ## [0.3.7] - 2026-09-28
 
 Found running the single-source spread test: the mid-stream watchdog can close

@@ -160,23 +160,23 @@ agents:
     tools: [Read, Glob, Grep, WebSearch, WebFetch]
     max_turns: 25
     timeout_seconds: 600
-    # Updated 27 Sep after a real natural completion, not just cutoff points.
-    # The broad "map all 6 sources" task was cut off twice (223,194 tokens,
-    # then 639,589 after the ceiling was tripled) before being abandoned in
-    # favour of splitting it into one task per source (see fail_or_abandon and
-    # the wiki). A hand-written single-source task (DVLA only, the simplest
-    # source) then completed cleanly at 300,033 tokens / $0.22569.
-    #
-    # max_usd_per_run was briefly tightened to $0.75 from that one number, then
-    # put back to $1.00 on review: DVLA is the simplest of the sources (one
-    # small file, one silent-failure path), and one completed run gives a
-    # floor, not a range. gov.im's scraper alone is ~2.5x DVLA's line count
-    # with real regex parsing to read, and could plausibly cost double.
-    # Revisit with headroom once three or four sources have actually
-    # completed, not before. max_tokens_per_run stays at 600,000: ~2x the one
-    # real completion, untested against the heavier remaining sources.
+    # Updated 28 Sep after running all five single-source upstream-monitoring
+    # tasks (see the wiki for the full spread). Three completed cleanly (DVLA
+    # 300,033 tok/$0.22569; CheckCarDetails 194,918 tok/$0.13979; gov.im
+    # 416,116 tok/$0.23534). Two hit the 600,000-token ceiling and were cut off
+    # (MOT at 606,901; Chrystals at 613,726) despite both being legitimate,
+    # narrowly-scoped work, not runaway exploration -- catching 40% of
+    # genuinely single-source tasks means the ceiling was too tight, not that
+    # the tasks were too broad. max_tokens_per_run raised to 900,000: real
+    # headroom past both cutoff points, still nowhere near the original
+    # 1.8M-token broad-scope run this whole split was designed to avoid.
+    # max_usd_per_run stays at $1.00 as the real backstop: every single-source
+    # run so far, including both that hit the token ceiling, has stayed well
+    # under it ($0.14-$0.31), because cache_read/cache_write dominate over
+    # fresh input/output for this cache-heavy agent -- tokens bind first here,
+    # dollars are the belt-and-braces layer underneath, not the tight one.
     max_usd_per_run: 1.00
-    max_tokens_per_run: 600_000
+    max_tokens_per_run: 900_000
 
 pricing:
   # USD per million tokens. Input and output are list rates.
