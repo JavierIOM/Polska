@@ -1,7 +1,7 @@
 """One place to write to the activity feed, so every writer produces the same shape.
 
 Nothing here queries the feed. It is write-only by design: reading it back is the
-dashboard's job, in phase 5.
+dashboard's job (``polska.dashboard.routes.home``), not this module's.
 """
 
 from __future__ import annotations

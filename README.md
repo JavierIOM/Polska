@@ -3,11 +3,13 @@
 An autonomous company operator. An orchestrator decides what a business needs next,
 then dispatches agents to do it on a schedule, without anyone driving each step.
 
-Phases 1 through 3 of 5 are built: schema, models, migrations, the agent runner,
-cost accounting, and the orchestrator loop and scheduler. It has now run for real
-against a live key, against the CarScratch profile: see the dry run notes under
-Tests, and the two real bugs that run found and this fixed. Every automated test
-still runs against a fake SDK stream, by design.
+Phases 1 through 4 of 4 are built: schema, models, migrations, the agent runner,
+cost accounting, the orchestrator loop and scheduler, the approval gate, and the
+dashboard. It has now run for real against a live key, against the CarScratch
+profile: see the dry run notes under Tests, and the real bugs that run found and
+this fixed. Every automated test still runs against a fake SDK stream, by design.
+Deployment (Docker Compose, on a real droplet) is reviewed but not yet run for real;
+see Deployment below.
 
 ## Build status
 
@@ -16,8 +18,7 @@ still runs against a fake SDK stream, by design.
 | 1 | Schema, models, migrations | Done |
 | 2 | Agent runner, dry-run adapter, cost accounting | Done |
 | 3 | Orchestrator loop and scheduler | Done |
-| 4 | Approval gate | Partial: classification, dispatch and execution are done; the dashboard's approve/reject endpoints are not |
-| 5 | Dashboard | Not started |
+| 4 | Approval gate and dashboard (login, approvals, budget halts, orphan write-off, goals/activity/runs) | Done |
 
 ## The idea
 
@@ -179,13 +180,17 @@ These are not negotiable and the tests enforce several of them.
 ## Stack
 
 Python 3.12, SQLite in WAL mode, SQLAlchemy 2.0 with Alembic, Pydantic v2, the Claude
-Agent SDK. Phase 3 onwards adds APScheduler and FastAPI with plain HTML.
+Agent SDK. Phase 3 adds APScheduler; phase 4 adds FastAPI, Jinja2 and Argon2 for the
+dashboard, all plain server-rendered HTML, no frontend build step.
 
-Note on the Agent SDK: it shells out to the Claude Code CLI, so the Docker image will
-need Node 20+ alongside Python. That is a fatter image than a plain Messages API loop
-would need, and it buys the tool harness, the permission modes and per-run usage
-reporting without writing them. The runner reads its exact API from the installed
-package rather than from training-time recall: several fields on `ClaudeAgentOptions`
+Note on the Agent SDK: it shells out to the Claude Code CLI, which the package
+bundles as a platform-specific binary rather than requiring a separate Node install —
+confirmed on PyPI: `claude-agent-sdk` publishes distinct wheels per platform
+(`manylinux_2_17_x86_64`/`_aarch64`, `win_amd64`, `macosx_11_0_arm64`), each with its
+own bundled CLI binary, so a plain `pip install` inside a glibc-based Linux image
+(not Alpine/musl) resolves the right one on its own; no Node/npm install step needed
+in the Dockerfile. The runner reads its exact API from the installed package rather
+than from training-time recall: several fields on `ClaudeAgentOptions`
 (`max_budget_usd`, `output_format`, `sandbox`, the `permission_mode` literals) did not
 exist as documented here, and the runner's cost accounting depends on getting the
 `ResultMessage.model_usage` key casing right, which was confirmed by reading the SDK's
@@ -205,13 +210,17 @@ config/default.yaml      Tunables: intervals, ceilings, agent models, tool allow
                          the irreversible-action list, model pricing. No secrets.
 companies/               One YAML profile per company.
 migrations/              Alembic. The DSN comes from settings, not alembic.ini.
+Dockerfile                One image for both containers (see docker-compose.yml).
+docker-compose.yml        scheduler + dashboard, sharing data/ and companies/.
 src/polska/
   config/                Env settings, config schema, company profile loader.
   db/                    Engine, models, enums, the task state machine.
   schemas/               Pydantic contracts for every agent output.
   adapters/              The adapter interface, the dry-run implementation, registry.
+  dashboard/             The FastAPI dashboard: app, routes, auth, templates.
   activity.py            The one place that writes to the activity feed.
   budget.py              The budget guard: reserve before a run, release after.
+  cli.py                 Operator commands: init-auth, tick.
   gate.py                Classifies and dispatches proposed actions.
   prompts.py             Per-agent system prompt templates.
   runner.py              One agent invocation against the SDK, fully accounted for.
@@ -259,6 +268,124 @@ This does not run migrations itself; run `alembic upgrade head` first, same as a
 deployment. It recovers any orphaned run from a previous crash, then starts one
 `AsyncIOScheduler` job on `scheduler.interval_hours` that reloads every company
 profile from disk on each firing and ticks each active one in turn.
+
+## Deployment
+
+Two containers from one image (`Dockerfile`, `docker-compose.yml`): `scheduler` runs
+`polska.main` (the orchestrator loop), `dashboard` runs `polska.dashboard.server`
+(the approval/budget UI). They share the SQLite database and company profiles
+through bind mounts and nothing else.
+
+**Current security posture, temporary and deliberate:** the dashboard binds to
+`0.0.0.0` and is reachable from the open internet on `POLSKA_DASHBOARD_PORT`
+(default 8000), with only a rate-limited, Argon2-hashed single admin password in
+front of it. This is acceptable *only* while `integrations.force_dry_run` stays
+`true`, i.e. before any adapter can perform a real external effect. **Before that
+changes**, either put this behind
+[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+(or an equivalent identity-aware proxy) or set `POLSKA_DASHBOARD_HOST=127.0.0.1` and
+reach it over an SSH tunnel instead. Both are one env var and a restart; neither is
+done automatically, because that decision has consequences (losing remote access
+entirely, in the tunnel case) that should never happen without someone meaning it.
+
+I have not run this Dockerfile/compose stack myself: there is no Docker in the
+environment I built it in. What follows is built and reviewed carefully against the
+Claude Agent SDK's own published wheels (confirmed on PyPI: a `manylinux_2_17_x86_64`
+wheel exists, with a bundled Linux `claude` binary resolved by a fresh `pip install`
+inside the image), not run end to end on real Ubuntu hardware. Treat the first real
+`docker compose up` as the actual test, and tell me what breaks.
+
+### Fresh Ubuntu 24.04 box, assuming nothing installed but the OS
+
+1. **Install Docker Engine and the Compose plugin** (not Docker Desktop, which
+   Ubuntu server doesn't need):
+   ```
+   curl -fsSL https://get.docker.com | sudo sh
+   sudo usermod -aG docker $USER   # log out and back in after this
+   docker compose version          # confirms the plugin is present
+   ```
+
+2. **Clone the repo and prepare local state:**
+   ```
+   git clone <this repo's URL> polska && cd polska
+   mkdir -p data
+   cp .env.example .env
+   ```
+
+3. **Put a real `ANTHROPIC_API_KEY` in `.env`.** Leave `POLSKA_ADMIN_PASSWORD_HASH`
+   and `POLSKA_SESSION_SECRET` blank for now; the next steps generate them.
+
+4. **Build the image and run the database migrations** (a deliberate, separate step;
+   nothing here or in the app auto-migrates on boot):
+   ```
+   docker compose build
+   docker compose run --rm scheduler alembic upgrade head
+   ```
+
+5. **Generate the dashboard's admin credentials.** This is a command you run, not a
+   value anyone hands you: it prompts for a password (never echoed, never taken as a
+   command-line argument, never logged) and prints an Argon2 hash plus a fresh random
+   session secret.
+   ```
+   docker compose run --rm scheduler python -m polska.cli init-auth
+   ```
+   Paste the two printed lines (`POLSKA_ADMIN_PASSWORD_HASH=...`,
+   `POLSKA_SESSION_SECRET=...`) into `.env`.
+
+6. **Start both containers:**
+   ```
+   docker compose up -d
+   docker compose logs -f
+   ```
+   The dashboard is now on `http://<droplet-ip>:8000/login`. The scheduler is running
+   but, per `scheduler.run_on_start: false` and `IntervalTrigger`'s own default
+   (`now + interval_hours`, computed fresh on every process start), it will not tick
+   on its own until a full `interval_hours` has passed.
+
+7. **Trigger the first tick yourself, on your own schedule, not the container's:**
+   ```
+   docker compose exec scheduler python -m polska.cli tick
+   ```
+   Omit the company slug to tick every active company, or pass one
+   (`python -m polska.cli tick carscratch`) to run just it. This is the exact same
+   `run_company_tick` call the scheduler makes on its own interval, run once, now,
+   and it prints the same summary line `scripts/observe_ticks.py` does.
+
+### What each container actually restarts on
+
+Both services are `restart: unless-stopped`: a crash restarts them, a host reboot
+restarts them, an explicit `docker compose stop` does not get silently undone. That
+policy has nothing to do with whether a *tick* fires on restart, which is a
+completely separate, application-level decision (step 7's `IntervalTrigger` point) —
+restarting the scheduler container never fires an immediate tick on its own.
+
+### Editing a company profile or a ceiling after deployment
+
+`companies/` and `config/` are bind-mounted, not baked into the image: edit
+`companies/carscratch.yaml` or `config/default.yaml` directly on the droplet and the
+*next* tick picks it up (each tick reloads every profile from disk; `config/` is
+read once at process start, so a config change needs
+`docker compose restart scheduler dashboard` to take effect). No rebuild needed
+either way, since neither is `COPY`'d into the image.
+
+### The dashboard's login, specifically
+
+- **Password hashing:** Argon2id, via `argon2-cffi`, generated and verified in
+  `polska/dashboard/security.py`. Never a plaintext password stored anywhere.
+- **Rate limiting:** 5 failed attempts per IP locks that IP out for 15 minutes,
+  in-process memory (see the module docstring in `security.py` for what that
+  means if this ever runs with more than one uvicorn worker — it currently
+  does not).
+- **Session cookie:** Starlette's `SessionMiddleware`, `HttpOnly` and
+  `SameSite=Lax` always set; `Secure` is `POLSKA_DASHBOARD_COOKIE_SECURE`
+  (default `false`, because this currently serves plain HTTP — flip it to
+  `true` the moment a TLS-terminating proxy, Cloudflare or otherwise, sits in
+  front of it, or logins will silently fail because the browser refuses to
+  send the cookie back).
+- **CSRF:** a synchronizer token, one per session, stored server-side and
+  required as a hidden field on every state-changing form (login, logout,
+  approve, reject, clear a halt, write off an orphan). A request missing it or
+  carrying the wrong one gets a 403 before touching anything.
 
 ## Tests
 

@@ -11,6 +11,16 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+#: Correct for an editable install (``pip install -e .``, true in dev and in
+#: CI): ``__file__`` then resolves inside the real source tree, three parents
+#: up from this file. A non-editable install (the Docker image) copies the
+#: package into site-packages instead, where this would resolve to somewhere
+#: under site-packages, not the repo. That never actually bites: every field
+#: below that uses this is also named in .env.example with a relative path
+#: (resolved against the process's cwd, which the Dockerfile sets to /app),
+#: and .env always wins over this default. It would only bite something that
+#: read REPO_ROOT directly rather than through a Settings field, and nothing
+#: does.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -38,6 +48,22 @@ class Settings(BaseSettings):
     admin_password_hash: SecretStr = SecretStr("")
     session_secret: SecretStr = SecretStr("")
     session_max_age_seconds: int = 60 * 60 * 12
+
+    #: 0.0.0.0 exposes this to the network; 127.0.0.1 requires an SSH tunnel or a
+    #: reverse proxy on the same host. This is a deliberate per-deployment choice,
+    #: not a code decision, which is exactly why it is a setting rather than
+    #: hardcoded either way. Temporary, public-facing use is the current plan
+    #: (see README): this must move behind Cloudflare Access or back to
+    #: 127.0.0.1 before any adapter stops being force_dry_run.
+    dashboard_host: str = "0.0.0.0"
+    dashboard_port: int = 8000
+    #: The session cookie's Secure flag: only sent back over HTTPS. False by
+    #: default because this currently serves plain HTTP directly; set true the
+    #: moment a TLS-terminating proxy (Cloudflare or otherwise) sits in front of
+    #: it, or the cookie will still be issued but the browser will silently
+    #: refuse to return it and every login will appear to fail for no visible
+    #: reason.
+    dashboard_cookie_secure: bool = False
 
     log_level: str = "INFO"
     sql_echo: bool = False

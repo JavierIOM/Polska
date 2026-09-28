@@ -20,7 +20,13 @@ from polska.adapters.registry import AdapterRegistry, UnknownAdapter
 from polska.config.appconfig import AppConfig
 from polska.db.enums import ActivityKind, ApprovalStatus
 from polska.db.models import ActivityEvent, Approval, Company, Task
-from polska.gate import ApprovalNotDecided, dispatch_action, execute_approval
+from polska.gate import (
+    ApprovalAlreadyDecided,
+    ApprovalNotDecided,
+    decide_approval,
+    dispatch_action,
+    execute_approval,
+)
 from polska.schemas.actions import ActionRequest
 
 
@@ -252,6 +258,100 @@ async def test_without_force_dry_run_an_unregistered_adapter_fails_loudly(
             run_id=None,
             action=action,
         )
+
+
+# -------------------------------------------------------------------------- decision
+
+
+async def test_deciding_approved_lets_execute_approval_then_run_it(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    """The dashboard's approve route: decide, then execute, as two separate
+    calls, in that order. This is what proves that sequence actually works."""
+    action = _action(action_type="email.send")
+    approval = await dispatch_action(
+        session,
+        app_config,
+        registry,
+        company_id=company.id,
+        task_id=None,
+        run_id=None,
+        action=action,
+    )
+    decided = decide_approval(session, approval, approved=True, decided_by="javier")
+    assert decided.status == ApprovalStatus.APPROVED
+    assert decided.decided_by == "javier"
+    assert decided.decided_at is not None
+
+    result = await execute_approval(session, app_config, registry, decided)
+    assert result.status == ApprovalStatus.EXECUTED
+
+
+async def test_deciding_rejected_never_touches_the_adapter(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    action = _action(action_type="email.send")
+    approval = await dispatch_action(
+        session,
+        app_config,
+        registry,
+        company_id=company.id,
+        task_id=None,
+        run_id=None,
+        action=action,
+    )
+    decided = decide_approval(
+        session, approval, approved=False, decided_by="javier", note="Wrong tone."
+    )
+    assert decided.status == ApprovalStatus.REJECTED
+    assert decided.decision_note == "Wrong tone."
+    assert decided.execution_result is None
+    kinds = [e.kind for e in _feed(session)]
+    assert ActivityKind.ACTION_EXECUTED not in kinds
+
+
+async def test_deciding_an_already_decided_approval_is_refused(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    action = _action(action_type="email.send")
+    approval = await dispatch_action(
+        session,
+        app_config,
+        registry,
+        company_id=company.id,
+        task_id=None,
+        run_id=None,
+        action=action,
+    )
+    decide_approval(session, approval, approved=True, decided_by="javier")
+    with pytest.raises(ApprovalAlreadyDecided):
+        decide_approval(session, approval, approved=False, decided_by="javier")
+
+
+async def test_deciding_an_expired_pending_approval_expires_it_instead(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    """Nothing else in the system sweeps for a passed expires_at. This is the
+    first place that actually looks, so a stale decision is refused rather
+    than silently honoured."""
+    import datetime as dt
+
+    action = _action(action_type="email.send")
+    approval = await dispatch_action(
+        session,
+        app_config,
+        registry,
+        company_id=company.id,
+        task_id=None,
+        run_id=None,
+        action=action,
+    )
+    approval.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+    session.commit()
+
+    with pytest.raises(ApprovalAlreadyDecided):
+        decide_approval(session, approval, approved=True, decided_by="javier")
+    assert approval.status == ApprovalStatus.EXPIRED
 
 
 # ------------------------------------------------------------------------- execution

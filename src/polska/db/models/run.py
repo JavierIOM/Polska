@@ -14,6 +14,7 @@ from polska.db.types import UTCDateTime, utcnow
 
 if TYPE_CHECKING:
     from polska.db.models.approval import Approval
+    from polska.db.models.budget import BudgetHalt
     from polska.db.models.company import Company
     from polska.db.models.task import Task
 
@@ -83,6 +84,7 @@ class Run(Base):
     company: Mapped[Company] = relationship(back_populates="runs")
     task: Mapped[Task | None] = relationship(back_populates="runs")
     approvals: Mapped[list[Approval]] = relationship(back_populates="run")
+    halts: Mapped[list[BudgetHalt]] = relationship(back_populates="run")
 
     @property
     def total_tokens(self) -> int:

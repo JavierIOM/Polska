@@ -907,6 +907,7 @@ class AgentRunner:
         write_halt(
             session,
             company_id=company_id,
+            run_id=run.id,
             scope=BudgetScope.RUN,
             limit_name=limit_name,
             limit_value=limit_value,

@@ -37,6 +37,11 @@ class ApprovalNotDecided(Exception):
     """Raised if execution is attempted on an approval nobody has approved yet."""
 
 
+class ApprovalAlreadyDecided(Exception):
+    """Raised if a decision is attempted on an approval that is not pending
+    (already decided, or its window has passed)."""
+
+
 async def dispatch_action(
     session: Session,
     app_config: AppConfig,
@@ -134,6 +139,71 @@ async def dispatch_action(
 
     approval.expires_at = utcnow() + dt.timedelta(hours=app_config.approvals.expiry_hours)
     session.commit()
+    return approval
+
+
+def decide_approval(
+    session: Session,
+    approval: Approval,
+    *,
+    approved: bool,
+    decided_by: str,
+    note: str = "",
+) -> Approval:
+    """Record a human's yes or no. Never executes anything itself.
+
+    Deliberately split from :func:`execute_approval`: a rejection has nothing to
+    run, and even an approval's own execution is a second, separate step the
+    caller chooses to take next (the dashboard's approve route calls this, then
+    :func:`execute_approval`, in that order). ``decided_by`` is required, never
+    defaulted, so every decision has a name attached the same way every other
+    deliberate human act in this system does.
+
+    Refuses a decision on anything but a still-open ``PENDING`` approval,
+    including one whose ``expires_at`` has quietly passed: rather than silently
+    honouring a stale decision, this is what actually moves it to ``EXPIRED`` the
+    first time anyone looks at it, since nothing else in the system sweeps for
+    that on its own.
+    """
+    now = utcnow()
+    if approval.status == ApprovalStatus.PENDING and approval.is_expired(now):
+        approval.status = ApprovalStatus.EXPIRED
+        session.commit()
+        log(
+            session,
+            company_id=approval.company_id,
+            kind=ActivityKind.APPROVAL_DECIDED,
+            summary=f"Expired before a decision arrived: {approval.action_type}",
+            task_id=approval.task_id,
+            run_id=approval.run_id,
+            approval_id=approval.id,
+        )
+        raise ApprovalAlreadyDecided(
+            f"Approval {approval.id} expired at {approval.expires_at} before this "
+            "decision was recorded."
+        )
+
+    if approval.status != ApprovalStatus.PENDING:
+        raise ApprovalAlreadyDecided(
+            f"Approval {approval.id} is already {approval.status.value}, not pending."
+        )
+
+    approval.status = ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED
+    approval.decided_by = decided_by
+    approval.decided_at = now
+    approval.decision_note = note or None
+    session.commit()
+
+    log(
+        session,
+        company_id=approval.company_id,
+        kind=ActivityKind.APPROVAL_DECIDED,
+        summary=f"{'Approved' if approved else 'Rejected'} by {decided_by}: {approval.action_type}",
+        detail={"decided_by": decided_by, "note": note},
+        task_id=approval.task_id,
+        run_id=approval.run_id,
+        approval_id=approval.id,
+    )
     return approval
 
 

@@ -5,7 +5,66 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.8] - 2026-09-28
+## [0.4.0] - 2026-09-28
+
+Phase 4: the dashboard, plus a first pass at real deployment (Docker Compose for
+a fresh Ubuntu 24.04 droplet). Function over polish throughout: plain
+server-rendered HTML via Jinja2, no frontend build step.
+
+### Added
+
+- `polska/dashboard/`: a FastAPI app with session-cookie login (Argon2 password
+  hash, per-IP rate limiting on failed attempts, HttpOnly + SameSite=Lax
+  cookies, a CSRF synchronizer token required on every state-changing form),
+  and nine routes covering: the goals/activity-feed/runs overview; approving or
+  rejecting a pending `Approval` (showing its stored `preview`, executing its
+  stored `payload` exactly, never re-planning); clearing a `BudgetHalt`, with
+  the run that caused it shown, not just its reason text; writing off an
+  `ORPHANED` run.
+- `gate.decide_approval`: records a human's approve/reject decision, separately
+  from `execute_approval` actually running it — the dashboard's approve route
+  calls both, in that order. Refuses a decision on anything but a still-`PENDING`
+  approval, and is the first thing that actually moves a `PENDING` approval to
+  `EXPIRED` once its window has passed (nothing else in the system swept for
+  that before).
+- `budget.clear_halt`: the one function that resumes a company after a halt,
+  writing a `BUDGET_RESUMED` activity event. Nothing in `BudgetGuard` calls
+  this itself, by design.
+- `BudgetHalt.run_id` (migration `1dd12b8e308b`): the specific run that tripped
+  a RUN-scoped halt, so the dashboard can show it directly instead of parsing
+  it out of the reason text.
+- `polska/cli.py`: `init-auth` (prompts for a password via `getpass`, never a
+  CLI argument or a value anyone else picks; prints the Argon2 hash and a
+  fresh session secret to paste into `.env`) and `tick [slug]` (runs one
+  planning/dispatch cycle immediately, for one or every company — the manual
+  override for the scheduler's own 24-hour interval, which deliberately never
+  fires on its own the moment a fresh container boots).
+- `Dockerfile` / `docker-compose.yml` / `.dockerignore`: one image, two
+  services (`scheduler`, `dashboard`) sharing the SQLite database and company
+  profiles through bind mounts. Neither container runs migrations or seeds
+  auth on its own — both stay explicit, separate steps, the same rule
+  `main.py` already applied to migrations.
+- README `## Deployment`: the full fresh-Ubuntu-24.04 walkthrough, and an
+  explicit note that the dashboard is temporarily, deliberately public
+  (`0.0.0.0`, no proxy) while `force_dry_run` stays true, with the exact two
+  ways to close that (Cloudflare Access, or `POLSKA_DASHBOARD_HOST=127.0.0.1`
+  behind an SSH tunnel) before any adapter can perform a real effect.
+
+### Fixed
+
+- README claimed the Docker image would need a separate Node.js install
+  alongside Python for the Claude Agent SDK's CLI. Checked against PyPI:
+  `claude-agent-sdk` publishes a platform-specific wheel per platform
+  (including `manylinux_2_17_x86_64`), each bundling its own CLI binary, so a
+  plain `pip install` inside a glibc-based Linux image resolves it with no
+  Node/npm step at all.
+
+### Note
+
+Not run against a real Docker installation: none exists in the environment
+this was built in. Reviewed carefully against the SDK's published wheels
+instead of run end to end; the first real `docker compose up` on the actual
+droplet is the real test.
 
 Four fixes from reviewing the single-source spread test's results.
 

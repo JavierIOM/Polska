@@ -133,11 +133,19 @@ def write_halt(
     observed_value: float,
     period_key: str | None,
     reason: str,
+    run_id: int | None = None,
 ) -> BudgetHalt:
     """Record a crossed ceiling. Committed immediately: the stop is logged before
-    it takes effect, the same rule the approval gate follows for external effects."""
+    it takes effect, the same rule the approval gate follows for external effects.
+
+    ``run_id`` is the specific run that tripped this, for a RUN-scoped halt; left
+    unset for a DAY/COMPANY-scoped one, which is never about a single run. This
+    is what lets the dashboard show the run that caused a halt, not just its
+    reason text.
+    """
     halt = BudgetHalt(
         company_id=company_id,
+        run_id=run_id,
         scope=scope,
         limit_name=limit_name,
         limit_value=limit_value,
@@ -147,6 +155,46 @@ def write_halt(
         created_at=utcnow(),
     )
     session.add(halt)
+    session.commit()
+    return halt
+
+
+def clear_halt(
+    session: Session, halt: BudgetHalt, *, cleared_by: str, note: str = ""
+) -> BudgetHalt:
+    """Resume a company (or, for a global halt, every company) after a human has
+    decided it is safe. The one function the dashboard's clear button calls.
+
+    Deliberately the only way a :class:`BudgetHalt` ever stops blocking: nothing
+    in :class:`BudgetGuard` calls this itself, by design, so the guard can never
+    talk itself back into spending. ``cleared_by`` is required, never defaulted,
+    so every resume is a stated decision with a name attached, the same
+    discipline :func:`write_off_orphan` applies to correcting a cost figure.
+    """
+    if not halt.is_active:
+        raise ValueError(
+            f"BudgetHalt {halt.id} was already cleared at {halt.cleared_at} by "
+            f"{halt.cleared_by!r}. clear_halt only resumes an open halt; it is not "
+            "a way to edit or re-clear one that is already closed."
+        )
+
+    halt.cleared_at = utcnow()
+    halt.cleared_by = cleared_by
+
+    log(
+        session,
+        company_id=halt.company_id,
+        kind=ActivityKind.BUDGET_RESUMED,
+        summary=(f"{halt.scope.value} ceiling '{halt.limit_name}' halt cleared by {cleared_by}"),
+        detail={
+            "halt_id": halt.id,
+            "limit_name": halt.limit_name,
+            "limit_value": halt.limit_value,
+            "observed_value": halt.observed_value,
+            "cleared_by": cleared_by,
+            "note": note,
+        },
+    )
     session.commit()
     return halt
 
@@ -275,6 +323,7 @@ class BudgetGuard:
                 write_halt(
                     session,
                     company_id=company_id,
+                    run_id=run.id,
                     scope=BudgetScope.RUN,
                     limit_name="max_usd_per_run",
                     limit_value=max_usd,
@@ -294,6 +343,7 @@ class BudgetGuard:
                 write_halt(
                     session,
                     company_id=company_id,
+                    run_id=run.id,
                     scope=BudgetScope.RUN,
                     limit_name="max_tokens_per_run",
                     limit_value=max_tokens,

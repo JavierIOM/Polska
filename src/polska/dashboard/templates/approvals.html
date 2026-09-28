@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Polska — approvals{% endblock %}
+{% block content %}
+{% if not company %}
+<p class="muted">No companies loaded yet.</p>
+{% else %}
+<h1>Approvals — {{ company.slug }}</h1>
+
+<h2>Pending ({{ pending|length }})</h2>
+{% for a in pending %}
+<div class="card">
+  <p>
+    <span class="pill">{{ a.action_type }}</span> via {{ a.adapter }}
+    <span class="muted">requested {{ a.requested_at.strftime("%Y-%m-%d %H:%M") }}</span>
+    {% if a.expires_at %}<span class="muted">· expires {{ a.expires_at.strftime("%Y-%m-%d %H:%M") }}</span>{% endif %}
+  </p>
+  {% if a.task %}<p class="muted">Task: {{ a.task.title }}</p>{% endif %}
+  <p><strong>Preview of what will be done, exactly as it will be done:</strong></p>
+  <pre>{{ a.preview }}</pre>
+  <form method="post" action="/approvals/{{ a.id }}/approve" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="text" name="note" placeholder="Note (optional)">
+    <button type="submit" class="approve">Approve &amp; execute</button>
+  </form>
+  <form method="post" action="/approvals/{{ a.id }}/reject" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="text" name="note" placeholder="Reason (optional)">
+    <button type="submit" class="reject">Reject</button>
+  </form>
+</div>
+{% else %}
+<p class="muted">Nothing waiting on a decision.</p>
+{% endfor %}
+
+<h2>Recently decided</h2>
+<table>
+  <tr><th>Action</th><th>Status</th><th>Decided by</th><th>When</th></tr>
+  {% for a in decided %}
+  <tr>
+    <td>{{ a.action_type }}</td>
+    <td><span class="pill">{{ a.status.value }}</span></td>
+    <td>{{ a.decided_by or '—' }}</td>
+    <td class="muted">{{ (a.decided_at or a.requested_at).strftime("%Y-%m-%d %H:%M") }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">Nothing decided yet.</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

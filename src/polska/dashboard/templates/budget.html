@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Polska — budget{% endblock %}
+{% block content %}
+{% if not company %}
+<p class="muted">No companies loaded yet.</p>
+{% else %}
+<h1>Budget — {{ company.slug }}</h1>
+
+<h2>Open halts ({{ open_halts|length }})</h2>
+<p class="muted">Clearing one is the only way the scheduler dispatches for this company again.
+Nothing here happens on its own.</p>
+{% for h in open_halts %}
+<div class="card">
+  <p>
+    <span class="pill">{{ h.scope.value }}</span> <strong>{{ h.limit_name }}</strong>
+    &mdash; ${{ "%.4f"|format(h.observed_value) }} against a limit of
+    {% if h.scope.value == 'run' and h.limit_name == 'max_tokens_per_run' %}{{ h.limit_value|int }}{% else %}${{ "%.2f"|format(h.limit_value) }}{% endif %}
+    <span class="muted">({{ h.created_at.strftime("%Y-%m-%d %H:%M") }})</span>
+  </p>
+  <p>{{ h.reason }}</p>
+  {% if h.run %}
+  <p class="muted">Caused by run #{{ h.run.id }}: {{ h.run.agent.value }} on {{ h.run.model }},
+    status {{ h.run.status.value }}, {{ h.run.total_tokens }} tokens, {{ h.run.cost_usd|money }}.</p>
+  {% endif %}
+  <form method="post" action="/budget/halts/{{ h.id }}/clear">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="text" name="note" placeholder="Why it's safe to resume (optional)">
+    <button type="submit" class="approve">Clear</button>
+  </form>
+</div>
+{% else %}
+<p class="muted">No open halts.</p>
+{% endfor %}
+
+<h2>Orphaned runs awaiting write-off ({{ orphans|length }})</h2>
+<p class="muted">A process died mid-run; each is priced at its reservation's worst case until
+confirmed otherwise.</p>
+{% for r in orphans %}
+<div class="card">
+  <p>Run #{{ r.id }}: {{ r.agent.value }} on {{ r.model }}, priced at {{ r.cost_usd|money }}
+     (worst case), started {{ r.started_at.strftime("%Y-%m-%d %H:%M") }}.</p>
+  <form method="post" action="/budget/orphans/{{ r.id }}/write-off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="number" step="0.00001" min="0" name="actual_cost_usd" placeholder="Actual cost ($)" required>
+    <input type="text" name="note" placeholder="How you know (optional)">
+    <button type="submit">Write off</button>
+  </form>
+</div>
+{% else %}
+<p class="muted">No orphaned runs.</p>
+{% endfor %}
+
+<h2>Recently cleared</h2>
+<table>
+  <tr><th>Scope</th><th>Limit</th><th>Cleared by</th><th>When</th></tr>
+  {% for h in cleared_halts %}
+  <tr>
+    <td>{{ h.scope.value }}</td>
+    <td>{{ h.limit_name }}</td>
+    <td>{{ h.cleared_by }}</td>
+    <td class="muted">{{ h.cleared_at.strftime("%Y-%m-%d %H:%M") }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">Nothing cleared yet.</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

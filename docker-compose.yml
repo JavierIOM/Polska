@@ -1,0 +1,48 @@
+# Two containers, one image (see Dockerfile), sharing the SQLite database and
+# company profiles through bind mounts, nothing else.
+#
+# Deliberately does NOT run migrations or seed auth on its own: this project's
+# own rule (see main.py) is that migrations are a separate, explicit step, not
+# something a container does to itself on boot. Before the first `up`:
+#
+#   docker compose build
+#   docker compose run --rm scheduler alembic upgrade head
+#   docker compose run --rm scheduler python -m polska.cli init-auth
+#   # paste the two printed lines into .env, then:
+#   docker compose up -d
+#
+# See README.md's Deployment section for the full walkthrough, including why
+# the dashboard is reachable on the network at all right now.
+
+services:
+  scheduler:
+    build: .
+    command: ["python", "-m", "polska.main"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./companies:/app/companies
+      - ./config:/app/config
+    # Restarts on both a crash and a host reboot. Does not, on its own, cause
+    # an immediate tick either time: IntervalTrigger computes its first fire
+    # as now + interval_hours when no start_date is given (see main.py), and
+    # scheduler.run_on_start defaults to false. A container that has been
+    # rebuilt or restarted still waits out the normal interval; trigger a
+    # tick immediately with:
+    #   docker compose exec scheduler python -m polska.cli tick
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: ["python", "-m", "polska.dashboard.server"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./companies:/app/companies
+      - ./config:/app/config
+    ports:
+      # Host-side mapping. Bind it to 127.0.0.1:${POLSKA_DASHBOARD_PORT} here
+      # instead if this ever needs to stop being reachable from the network
+      # without touching POLSKA_DASHBOARD_HOST inside the container.
+      - "${POLSKA_DASHBOARD_PORT:-8000}:${POLSKA_DASHBOARD_PORT:-8000}"
+    restart: unless-stopped

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "polska"
-version = "0.3.8"
+version = "0.4.0"
 description = "Autonomous company operator: an orchestrator that plans work and dispatches agents on a schedule."
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
@@ -28,14 +28,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Phase 5 onwards (the dashboard). Listed now so the shape of the final install is
-# visible.
+# Phase 4: the dashboard.
 runtime = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
     "jinja2>=3.1.4",
     "itsdangerous>=2.2.0",
     "argon2-cffi>=23.1.0",
+    # FastAPI's Form(...) dependency (the login form) needs this at runtime even
+    # though nothing imports it by name.
+    "python-multipart>=0.0.12",
 ]
 dev = [
     "pytest>=8.3.0",
@@ -43,7 +45,13 @@ dev = [
     "ruff>=0.8.0",
     # Windows has no IANA tz database; alembic's UTC timestamps need it.
     "tzdata>=2024.2; sys_platform == 'win32'",
+    # FastAPI's own TestClient is a thin wrapper over this.
+    "httpx>=0.27.0",
 ]
+
+[project.scripts]
+polska-cli = "polska.cli:main"
+polska-dashboard = "polska.dashboard.server:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/polska"]
@@ -68,3 +76,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # Asserting a named constant against a computed value reads better than the
 # inverse, which is what SIM300 would rewrite it to.
 "tests/*" = ["SIM300"]
+# Depends(...) as an argument default is FastAPI's own dependency-injection
+# pattern, not the antipattern B008 exists to catch (a mutable default built
+# once at import time). FastAPI calls it fresh per request.
+"src/polska/dashboard/*" = ["B008"]

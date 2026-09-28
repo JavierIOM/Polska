@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}Polska{% endblock %}</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    background: #111; color: #ddd; margin: 0; padding: 0; font-size: 14px;
+  }
+  a { color: #6cf; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header {
+    background: #1a1a1a; border-bottom: 1px solid #333; padding: 10px 20px;
+    display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+  }
+  header .brand { font-weight: bold; color: #fff; }
+  header nav a { padding: 4px 8px; border-radius: 3px; }
+  header nav a.active { background: #333; color: #fff; }
+  header .spacer { flex: 1; }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  h1, h2 { color: #fff; font-size: 1.1em; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #292929; vertical-align: top; }
+  th { color: #999; font-weight: normal; font-size: 0.85em; text-transform: uppercase; }
+  .card {
+    background: #1a1a1a; border: 1px solid #333; border-radius: 4px;
+    padding: 14px; margin-bottom: 16px;
+  }
+  .muted { color: #888; }
+  .error { color: #f66; }
+  .ok { color: #6f9; }
+  .warn { color: #fc6; }
+  pre { background: #0a0a0a; border: 1px solid #292929; padding: 10px; overflow-x: auto;
+        white-space: pre-wrap; word-break: break-word; }
+  button, input[type=submit] {
+    font-family: inherit; background: #2a2a2a; color: #ddd; border: 1px solid #444;
+    border-radius: 3px; padding: 5px 12px; cursor: pointer;
+  }
+  button:hover { background: #333; }
+  button.approve { border-color: #3a6; color: #6f9; }
+  button.reject { border-color: #a33; color: #f88; }
+  input[type=text], input[type=password], input[type=number], textarea {
+    font-family: inherit; background: #0a0a0a; color: #ddd; border: 1px solid #444;
+    border-radius: 3px; padding: 5px 8px;
+  }
+  .pill {
+    display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 0.85em;
+    border: 1px solid #444;
+  }
+  .company-select { margin-left: auto; }
+  form.inline { display: inline; }
+</style>
+</head>
+<body>
+{% if company_slug is not defined %}{% set company_slug = company.slug if company else None %}{% endif %}
+<header>
+  <span class="brand">Polska</span>
+  <nav>
+    <a href="/{% if company_slug %}?company_slug={{ company_slug }}{% endif %}" class="{{ 'active' if request.url.path == '/' else '' }}">Dashboard</a>
+    <a href="/approvals{% if company_slug %}?company_slug={{ company_slug }}{% endif %}" class="{{ 'active' if request.url.path == '/approvals' else '' }}">Approvals</a>
+    <a href="/budget{% if company_slug %}?company_slug={{ company_slug }}{% endif %}" class="{{ 'active' if request.url.path == '/budget' else '' }}">Budget</a>
+  </nav>
+  <div class="spacer"></div>
+  {% if companies is defined and companies|length > 1 %}
+  <form method="get" class="company-select">
+    <select name="company_slug" onchange="this.form.submit()">
+      {% for c in companies %}
+      <option value="{{ c.slug }}" {% if company and c.slug == company.slug %}selected{% endif %}>{{ c.slug }}</option>
+      {% endfor %}
+    </select>
+  </form>
+  {% endif %}
+  <form method="post" action="/logout" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Log out</button>
+  </form>
+</header>
+<main>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Polska — log in</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    background: #111; color: #ddd; margin: 0; padding: 0;
+    display: flex; align-items: center; justify-content: center; height: 100vh;
+  }
+  form {
+    background: #1a1a1a; border: 1px solid #333; border-radius: 4px;
+    padding: 24px; width: 280px;
+  }
+  h1 { color: #fff; font-size: 1.1em; margin-top: 0; }
+  input[type=password] {
+    font-family: inherit; width: 100%; background: #0a0a0a; color: #ddd;
+    border: 1px solid #444; border-radius: 3px; padding: 8px; margin-bottom: 12px;
+    box-sizing: border-box;
+  }
+  button {
+    font-family: inherit; width: 100%; background: #2a2a2a; color: #ddd;
+    border: 1px solid #444; border-radius: 3px; padding: 8px; cursor: pointer;
+  }
+  button:hover { background: #333; }
+  .error { color: #f66; font-size: 0.9em; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>Polska</h1>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="password" name="password" placeholder="Admin password" autofocus required>
+  <button type="submit">Log in</button>
+</form>
+</body>
+</html>

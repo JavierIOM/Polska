@@ -14,6 +14,7 @@ from polska.db.types import UTCDateTime, utcnow
 
 if TYPE_CHECKING:
     from polska.db.models.company import Company
+    from polska.db.models.run import Run
 
 
 class BudgetHalt(Base):
@@ -40,6 +41,14 @@ class BudgetHalt(Base):
     scope: Mapped[BudgetScope] = mapped_column(
         Enum(BudgetScope, native_enum=False, length=32, validate_strings=True)
     )
+    #: The specific run that tripped this, when there is one. Null for a
+    #: DAY/COMPANY-scoped halt, which is never about one single run. Set to
+    #: null rather than deleted if that run is ever removed, the same as
+    #: Approval.run_id: the halt's own record of what happened must survive
+    #: the run row it points at.
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     #: Which ceiling, e.g. "max_usd_per_day".
     limit_name: Mapped[str] = mapped_column(String(80))
     limit_value: Mapped[float] = mapped_column(Float)
@@ -54,6 +63,7 @@ class BudgetHalt(Base):
     cleared_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     company: Mapped[Company | None] = relationship(back_populates="halts")
+    run: Mapped[Run | None] = relationship(back_populates="halts")
 
     @property
     def is_active(self) -> bool:

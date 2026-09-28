@@ -16,12 +16,19 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from polska.budget import BudgetExceeded, BudgetGuard, active_halt, reconcile_orphaned_runs
+from polska.budget import (
+    BudgetExceeded,
+    BudgetGuard,
+    active_halt,
+    clear_halt,
+    reconcile_orphaned_runs,
+)
 from polska.config.appconfig import AppConfig
-from polska.db.enums import AgentName, BudgetScope, RunStatus
-from polska.db.models import Company, Run
+from polska.db.enums import ActivityKind, AgentName, BudgetScope, RunStatus
+from polska.db.models import ActivityEvent, Company, Run
 
 
 def _company(session: Session, **overrides: object) -> Company:
@@ -219,6 +226,91 @@ async def test_a_cleared_halt_no_longer_blocks(
         session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
     )
     assert reservation is not None
+
+
+# --------------------------------------------------------------------- clear_halt
+
+
+async def test_clear_halt_records_who_and_writes_an_activity_event(
+    session: Session, company: Company
+) -> None:
+    from polska.budget import write_halt
+
+    halt = write_halt(
+        session,
+        company_id=company.id,
+        scope=BudgetScope.COMPANY,
+        limit_name="max_usd_per_company",
+        limit_value=1.0,
+        observed_value=2.0,
+        period_key=None,
+        reason="manually injected for the test",
+    )
+    assert halt.is_active
+
+    cleared = clear_halt(session, halt, cleared_by="javier", note="topped up credit")
+    assert not cleared.is_active
+    assert cleared.cleared_by == "javier"
+    assert cleared.cleared_at is not None
+
+    events = list(session.execute(select(ActivityEvent)).scalars())
+    resumed = [e for e in events if e.kind == ActivityKind.BUDGET_RESUMED]
+    assert len(resumed) == 1
+    assert resumed[0].detail["cleared_by"] == "javier"
+
+
+async def test_clear_halt_refuses_an_already_cleared_halt(
+    session: Session, company: Company
+) -> None:
+    """Clearing is a one-way, one-time act: re-clearing (or editing who cleared
+    it) is not a thing this function does."""
+    from polska.budget import write_halt
+
+    halt = write_halt(
+        session,
+        company_id=company.id,
+        scope=BudgetScope.COMPANY,
+        limit_name="max_usd_per_company",
+        limit_value=1.0,
+        observed_value=2.0,
+        period_key=None,
+        reason="manually injected for the test",
+    )
+    clear_halt(session, halt, cleared_by="javier")
+    with pytest.raises(ValueError, match="already cleared"):
+        clear_halt(session, halt, cleared_by="someone_else")
+
+
+async def test_a_run_scoped_halt_carries_the_run_that_caused_it(
+    session: Session, company: Company
+) -> None:
+    """The dashboard shows the run a halt is about, not just its reason text."""
+    from polska.budget import write_halt
+
+    run = Run(
+        company_id=company.id,
+        agent=AgentName.ANALYST,
+        model="claude-sonnet-5",
+        status=RunStatus.INTERRUPTED,
+        cost_usd=1.5,
+    )
+    session.add(run)
+    session.flush()
+
+    halt = write_halt(
+        session,
+        company_id=company.id,
+        run_id=run.id,
+        scope=BudgetScope.RUN,
+        limit_name="mid_run_watchdog",
+        limit_value=1.0,
+        observed_value=1.5,
+        period_key=None,
+        reason=f"Run {run.id}: cut off mid-stream.",
+    )
+    assert halt.run_id == run.id
+    assert halt.run is run
+    assert run.halts == [halt]
 
 
 async def test_a_global_halt_blocks_a_company_that_never_tripped_it(

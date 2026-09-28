@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Polska — dashboard{% endblock %}
+{% block content %}
+{% if not company %}
+<p class="muted">No companies loaded yet.</p>
+{% else %}
+<h1>{{ company.name }} <span class="muted">({{ company.slug }})</span></h1>
+<p>
+  <a href="/approvals?company_slug={{ company.slug }}">{{ pending_approvals }} pending approval{{ 's' if pending_approvals != 1 }}</a>
+  &middot;
+  <a href="/budget?company_slug={{ company.slug }}">{{ open_halts }} open budget halt{{ 's' if open_halts != 1 }}</a>
+</p>
+
+<h2>Goals</h2>
+<table>
+  <tr><th>Goal</th><th>Progress</th><th>Status</th></tr>
+  {% for g in goals %}
+  <tr>
+    <td>{{ g.title }}<br><span class="muted">{{ g.key }}</span></td>
+    <td>{{ g.current_value|round(2) }} / {{ g.target_value|round(2) }} {{ g.unit }}
+        ({{ (g.progress * 100)|round(0) }}%)</td>
+    <td><span class="pill">{{ g.status.value }}</span></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3" class="muted">No goals.</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Recent runs</h2>
+<table>
+  <tr><th>Agent</th><th>Model</th><th>Status</th><th>Cost</th><th>Tokens</th><th>Started</th></tr>
+  {% for r in runs %}
+  <tr>
+    <td>{{ r.agent.value }}</td>
+    <td>{{ r.model }}</td>
+    <td><span class="pill">{{ r.status.value }}</span></td>
+    <td>{{ r.cost_usd|money }}</td>
+    <td>{{ r.total_tokens }}</td>
+    <td>{{ r.started_at.strftime("%Y-%m-%d %H:%M") }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">No runs yet.</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Activity feed</h2>
+<table>
+  <tr><th>When</th><th>Kind</th><th>Summary</th></tr>
+  {% for e in activity %}
+  <tr>
+    <td class="muted">{{ e.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td><span class="pill">{{ e.kind.value }}</span></td>
+    <td>{{ e.summary }}{% if e.error %}<br><span class="error">{{ e.error }}</span>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3" class="muted">Nothing yet.</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
