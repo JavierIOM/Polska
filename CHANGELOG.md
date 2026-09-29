@@ -5,6 +5,36 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-09-29
+
+The v0.5.0 build failed on the first real attempt: `setcap` isn't in
+`python:3.12-slim` and wasn't pulled in by anything else, so
+`docker compose build` exited non-zero at that step — and `docker compose up`
+then happily started the *previous*, unenforced image, because it had no
+reason to know the new one never finished. A container carrying the network
+boundary silently running without it is the same class of problem as
+starting against a stale schema.
+
+### Fixed
+
+- `setcap`/`getcap` are provided by `libcap2-bin`, not installed by the
+  packages already in the image. Added.
+
+### Added
+
+- A build-time smoke check verifying `setcap`, `getcap`, `iptables`, `node`,
+  `npm`, `npx` and `setpriv` are all actually present (and that `setpriv`
+  really carries the capability `setcap` was meant to grant it), failing
+  `docker compose build` loudly and by name rather than at first use.
+- `POLSKA_AGENT_ENFORCEMENT_VERSION`, baked into the image only if every
+  step the network restriction depends on succeeded, and checked by
+  `docker/entrypoint.sh` before it does anything else. A missing or
+  mismatched marker (an image that predates this, or one from an
+  incomplete build) refuses to start, the same fail-closed principle
+  `schema_check.py` already applies to a stale database, now covering a
+  stale image too — this is what actually closes the incident above, the
+  smoke check only stops it happening in the first place.
+
 ## [0.5.0] - 2026-09-29
 
 Found running the real deployment: an engineer task with a genuinely narrow,

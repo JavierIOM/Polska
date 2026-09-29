@@ -14,7 +14,23 @@
 # specifically; 1000 is never touched by it.
 set -eu
 
+#: Must match the Dockerfile's own ENV of the same name exactly. Bumped
+#: together whenever the enforcement scheme's shape changes, not just
+#: whenever the Dockerfile changes -- see the Dockerfile's own comment on
+#: this for the incident it closes: a build that failed partway through
+#: (setcap missing) left the previous, unenforced image in place, and
+#: `docker compose up` started it without complaint. A version mismatch
+#: here means either that image predates this entirely, or its build
+#: produced something incomplete; either way, refusing to start is the
+#: correct response, not a false negative to work around.
+_EXPECTED_ENFORCEMENT_VERSION=1
+
 if [ "${POLSKA_ENFORCE_AGENT_EGRESS:-0}" = "1" ]; then
+    if [ "${POLSKA_AGENT_ENFORCEMENT_VERSION:-}" != "$_EXPECTED_ENFORCEMENT_VERSION" ]; then
+        echo "entrypoint: POLSKA_AGENT_ENFORCEMENT_VERSION is '${POLSKA_AGENT_ENFORCEMENT_VERSION:-unset}', expected '$_EXPECTED_ENFORCEMENT_VERSION'. This image either predates agent-egress enforcement or its build did not complete the steps it depends on. Refusing to start rather than run the agent unrestricted while believing otherwise; rebuild with 'docker compose build' and check it actually succeeds before 'up'." >&2
+        exit 1
+    fi
+
     # Resolved once, here, and pinned into /etc/hosts below: the one host the
     # agent may reach is known ahead of time, so it never needs to make a DNS
     # query of its own at all (see the reject rule's own comment for why that

@@ -24,11 +24,15 @@ FROM python:3.12-slim
 # ca-certificates: the SDK's CLI makes real HTTPS calls to the Anthropic API.
 # git: workspace.py shells out to a real `git clone` for the engineer/analyst
 # task workspace; python:3.12-slim does not include it.
-# iptables, util-linux (setpriv): what makes "the agent has no network
-# access" a kernel-enforced fact instead of a sentence in a system prompt --
-# see docker/entrypoint.sh for the rule itself and why it exists at all.
+# iptables, util-linux (setpriv), libcap2-bin (setcap/getcap): what makes
+# "the agent has no network access" a kernel-enforced fact instead of a
+# sentence in a system prompt -- see docker/entrypoint.sh for the rule
+# itself. libcap2-bin was missed on the first pass of this: setcap isn't
+# pulled in by anything else here, and its absence failed the build with a
+# bare "not found", not a name -- see the smoke check near the end of this
+# file, added for exactly that.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates git iptables util-linux \
+        ca-certificates git iptables util-linux libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
 # Copied wholesale rather than symlinked piecemeal: npm and npx are
@@ -109,6 +113,43 @@ RUN chmod +x /entrypoint.sh
 # image (src/, migrations/, alembic.ini) and for running this image without
 # compose at all.
 RUN mkdir -p data companies config && chown -R polska:polska /app
+
+# Fails the build immediately, by name, if anything the agent's network
+# restriction depends on didn't actually make it into this image -- the
+# fix for a real incident: setcap was missing, the build failed with a bare
+# "not found", and `docker compose up` then happily started the previous,
+# unenforced image without that being visible anywhere except the verify
+# script catching it by accident. This is not a substitute for
+# scripts/verify_agent_egress.sh (that proves the *kernel rule* actually
+# blocks traffic, which cannot be checked at build time, only at
+# container start), it is what stops a missing tool from ever reaching
+# that point silently.
+RUN set -eu; \
+    missing=""; \
+    for tool in setcap getcap iptables node npm npx setpriv; do \
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"; \
+    done; \
+    if [ -n "$missing" ]; then \
+        echo "Build smoke check failed, missing:$missing" >&2; \
+        exit 1; \
+    fi; \
+    node --version; \
+    npm --version; \
+    case "$(getcap /usr/bin/setpriv)" in \
+        *cap_setuid*cap_setgid*|*cap_setgid*cap_setuid*) ;; \
+        *) echo "Build smoke check failed: setpriv is missing cap_setuid/cap_setgid" >&2; exit 1 ;; \
+    esac; \
+    test -x /usr/local/bin/polska-agent-cli || { echo "Build smoke check failed: polska-agent-cli wrapper missing or not executable" >&2; exit 1; }
+
+# Baked in only if every step above succeeded (a failed RUN aborts the build
+# before this line is ever reached), and checked by docker/entrypoint.sh
+# before it does anything else: a container started from an image that
+# predates this, or from one where the build silently produced something
+# incomplete, refuses to start rather than run the agent unrestricted while
+# everyone believes otherwise. Bump this string, and entrypoint.sh's
+# matching check, whenever the enforcement scheme's shape changes, not just
+# whenever this Dockerfile changes.
+ENV POLSKA_AGENT_ENFORCEMENT_VERSION=1
 
 # No USER directive: the container starts as root so entrypoint.sh can set up
 # the agent-egress iptables rule (needs CAP_NET_ADMIN, granted to the

@@ -416,11 +416,23 @@ and a DNS lookup for anything not already known is refused too. `--user agent`
 matters — running this as any other user proves nothing about what the agent
 itself can reach.
 
-If the scheduler container doesn't have the `NET_ADMIN` and `NET_RAW`
-capabilities `docker-compose.yml` grants it, or the kernel it runs on doesn't
-support the `iptables` `owner` match, the container refuses to start rather
-than run the agent unrestricted while believing otherwise — check
-`docker compose logs scheduler` for why.
+The container refuses to start, rather than run the agent unrestricted while
+believing otherwise, in two distinct cases — check `docker compose logs
+scheduler` to tell them apart:
+
+- **The image itself predates this, or its build didn't finish.** Every build
+  step this depends on (`setcap`, `iptables`, Node, the CLI wrapper) is
+  smoke-checked at build time — a missing tool fails `docker compose build`
+  loudly, by name, rather than at first use. A version marker baked into the
+  image only if that check passed is what `entrypoint.sh` looks for at
+  startup; a stale image from a build that failed partway through (this
+  happened once already: `setcap` was missing, the build failed, and
+  `docker compose up` happily started the *previous*, unenforced image
+  without complaint) fails this check and refuses to start. Always check that
+  `docker compose build` actually succeeded before `up`.
+- **The scheduler container's own capabilities or kernel are the problem**:
+  missing the `NET_ADMIN`/`NET_RAW` capabilities `docker-compose.yml` grants
+  it, or a kernel that doesn't support the `iptables` `owner` match.
 
 ### Node, and what the engineer/analyst agents can actually run
 
