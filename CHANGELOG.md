@@ -5,6 +5,23 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-09-29
+
+### Fixed
+
+- Every agent subprocess had been inheriting the dashboard's own
+  `POLSKA_ADMIN_PASSWORD_HASH` and `POLSKA_SESSION_SECRET` since the
+  dashboard shipped. `ClaudeAgentOptions.env` only adds to or overrides
+  individual keys in the SDK's own subprocess environment, it never
+  replaces it (confirmed against the SDK's own source), so nothing set on
+  that field had ever actually stopped the full parent environment
+  reaching the agent. The `polska-agent-cli` wrapper script now runs the
+  real CLI under `env -i`, passing through only `ANTHROPIC_API_KEY`, `PATH`
+  and `HOME` — the only point in the chain that can produce a genuinely
+  minimal environment rather than one more key layered onto a full one.
+  The build smoke check now also greps the generated wrapper for `env -i`,
+  so a future edit that quietly drops this fails the build.
+
 ## [0.5.2] - 2026-09-29
 
 The v0.5.0 toolchain fix didn't fix tasks 9 and 10: two more engineer runs,

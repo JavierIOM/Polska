@@ -88,15 +88,32 @@ COPY src/ ./src/
 RUN pip install --no-cache-dir ".[runtime]"
 
 # Resolve the SDK's bundled CLI binary once, at build time, and bake a
-# wrapper script around it that drops privileges to the `agent` UID before
-# ever executing a line of agent-controlled code. runner.py points
-# ClaudeAgentOptions.cli_path at this wrapper, never at the real binary
-# directly, so every agent invocation goes through the privilege drop
-# unconditionally, not by each call site remembering to ask for it.
+# wrapper script around it that drops privileges to the `agent` UID and
+# hands it a minimal, explicit environment before ever executing a line of
+# agent-controlled code. runner.py points ClaudeAgentOptions.cli_path at
+# this wrapper, never at the real binary directly, so every agent invocation
+# goes through both unconditionally, not by each call site remembering to
+# ask for it.
+#
+# The environment matters as much as the UID: ClaudeAgentOptions.env only
+# adds to or overrides individual keys in the SDK's own subprocess
+# environment, which otherwise starts as a full, unfiltered copy of this
+# process's own -- confirmed by reading the SDK's own source
+# (subprocess_cli.py: `{**inherited_env, ..., **self._options.env, ...}`,
+# an additive merge, never a replacement). There is no field on
+# ClaudeAgentOptions that produces a genuinely minimal subprocess
+# environment; `env -i` here is what does. Found live: every agent
+# subprocess had been inheriting POLSKA_ADMIN_PASSWORD_HASH and
+# POLSKA_SESSION_SECRET (the dashboard's own login secrets, meant for
+# nobody else) since the dashboard shipped, simply because nothing had ever
+# looked. Only ANTHROPIC_API_KEY, PATH and HOME survive into the real CLI's
+# environment; HOME is hardcoded to /home/agent rather than forwarded,
+# since the wrapper's own $HOME at this point is still /home/polska (it
+# has not dropped privileges yet).
 RUN REAL_CLI=$(find / -path /proc -prune -o -type f -name claude -path '*/_bundled/*' -print 2>/dev/null | head -1) \
     && test -n "$REAL_CLI" \
     && chmod +x "$REAL_CLI" \
-    && printf '#!/bin/sh\nset -eu\nexec setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs -- %s "$@"\n' "$REAL_CLI" > /usr/local/bin/polska-agent-cli \
+    && printf '#!/bin/sh\nset -eu\nexec env -i ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" PATH="$PATH" HOME=/home/agent setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs -- %s "$@"\n' "$REAL_CLI" > /usr/local/bin/polska-agent-cli \
     && chmod 755 /usr/local/bin/polska-agent-cli
 
 COPY migrations/ ./migrations/
@@ -139,7 +156,8 @@ RUN set -eu; \
         *cap_setuid*cap_setgid*|*cap_setgid*cap_setuid*) ;; \
         *) echo "Build smoke check failed: setpriv is missing cap_setuid/cap_setgid" >&2; exit 1 ;; \
     esac; \
-    test -x /usr/local/bin/polska-agent-cli || { echo "Build smoke check failed: polska-agent-cli wrapper missing or not executable" >&2; exit 1; }
+    test -x /usr/local/bin/polska-agent-cli || { echo "Build smoke check failed: polska-agent-cli wrapper missing or not executable" >&2; exit 1; }; \
+    grep -q "env -i" /usr/local/bin/polska-agent-cli || { echo "Build smoke check failed: polska-agent-cli wrapper no longer clears its environment before exec" >&2; exit 1; }
 
 # Baked in only if every step above succeeded (a failed RUN aborts the build
 # before this line is ever reached), and checked by docker/entrypoint.sh
