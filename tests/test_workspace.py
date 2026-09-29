@@ -7,13 +7,22 @@ enforcement and the credential-never-touches-disk claim are all provable locally
 
 from __future__ import annotations
 
+import datetime as dt
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from polska.config.company import CompanyProfile
-from polska.workspace import WorkspaceError, prepare_task_workspace
+from polska.db.enums import TaskState, TaskType
+from polska.db.models import Company, Task
+from polska.db.types import utcnow
+from polska.workspace import (
+    REPO_DIRNAME,
+    WorkspaceError,
+    prepare_task_workspace,
+    reclaim_node_modules_for_terminal_tasks,
+)
 
 
 def _run(args: list[str], cwd: Path) -> None:
@@ -344,20 +353,59 @@ def test_vendoring_is_skipped_for_a_non_node_repo(tmp_path, monkeypatch) -> None
     _ensure_node_dependencies_vendored(tmp_path, task_id=1)  # no package.json here
 
 
-def test_vendoring_is_skipped_once_node_modules_already_exists(tmp_path, monkeypatch) -> None:
-    """The real gate: is node_modules there, not whether this looks like the
-    first time. Already-vendored means nothing left to do, on a fresh clone
-    or a retroactive one."""
-    from polska.workspace import _ensure_node_dependencies_vendored
+def test_vendoring_is_skipped_once_the_completion_marker_exists(tmp_path, monkeypatch) -> None:
+    """The real gate: the completion marker, not whether node_modules exists.
+    Already-vendored means nothing left to do, on a fresh clone or a
+    retroactive one."""
+    from polska.workspace import _VENDORED_MARKER_NAME, _ensure_node_dependencies_vendored
 
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "node_modules").mkdir()
+    node_modules = tmp_path / "node_modules"
+    node_modules.mkdir()
+    (node_modules / _VENDORED_MARKER_NAME).write_text("ci\n", encoding="utf-8")
 
     def _fail_if_called(*args, **kwargs):
-        raise AssertionError("npm must never run once node_modules exists")
+        raise AssertionError("npm must never run once the completion marker exists")
 
     monkeypatch.setattr(subprocess, "run", _fail_if_called)
     _ensure_node_dependencies_vendored(tmp_path, task_id=1)
+
+
+def test_node_modules_without_the_marker_is_treated_as_partial_and_redone(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """The exact gap this closes: a container killed mid-install leaves
+    node_modules existing but incomplete, permanently indistinguishable from
+    a real one without something that only gets written on success. This
+    must be removed and reinstalled, not trusted."""
+    from polska.workspace import _VENDORED_MARKER_NAME, _ensure_node_dependencies_vendored
+
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+    node_modules = tmp_path / "node_modules"
+    stale_file = node_modules / "half-installed-package" / "index.js"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_text("truncated", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def _fake_run(args, **kwargs):
+        calls.append(args)
+        # Simulate a real npm ci: the stale partial content is gone (a real
+        # npm run would not magically un-truncate it), a fresh tree exists.
+        assert not stale_file.exists()
+        node_modules.mkdir(exist_ok=True)
+        (node_modules / "real-package").mkdir()
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    with caplog.at_level("WARNING", logger="polska.workspace"):
+        _ensure_node_dependencies_vendored(tmp_path, task_id=1)
+
+    assert calls == [["npm", "ci", "--no-audit", "--no-fund"]]
+    assert any("without a completion marker" in r.getMessage() for r in caplog.records)
+    assert (node_modules / _VENDORED_MARKER_NAME).exists()
+    assert not (node_modules / "half-installed-package").exists()
 
 
 def test_vendoring_runs_npm_ci_against_the_lockfile(tmp_path, monkeypatch) -> None:
@@ -531,6 +579,94 @@ def test_a_freshly_writable_clone_is_never_chmodded_by_vendoring(
     _ensure_node_dependencies_vendored(tmp_path, task_id=1)
 
     assert chmod_calls == []
+
+
+# ---------------------------------------------------------------- reclaiming
+
+
+def _terminal_task(session, company: Company, state: TaskState, *, finished_at) -> Task:
+    task = Task(
+        company_id=company.id,
+        type=TaskType.ENGINEERING,
+        title="x",
+        description="x",
+        rationale="x",
+    )
+    session.add(task)
+    session.flush()
+    task.transition_to(TaskState.RUNNING)
+    task.transition_to(state, now=finished_at)
+    session.commit()
+    return task
+
+
+def test_reclaim_deletes_node_modules_past_its_grace_period(session, company, tmp_path) -> None:
+    old_enough = utcnow() - dt.timedelta(hours=48)
+    task = _terminal_task(session, company, TaskState.DONE, finished_at=old_enough)
+    node_modules = tmp_path / str(task.id) / REPO_DIRNAME / "node_modules"
+    (node_modules / "some-package").mkdir(parents=True)
+
+    reclaimed = reclaim_node_modules_for_terminal_tasks(
+        session, tmp_path, grace_period=dt.timedelta(hours=24)
+    )
+
+    assert reclaimed == 1
+    assert not node_modules.exists()
+    assert (tmp_path / str(task.id) / REPO_DIRNAME).exists()  # the rest of the workspace survives
+
+
+def test_reclaim_leaves_a_recently_finished_task_alone(session, company, tmp_path) -> None:
+    just_finished = utcnow() - dt.timedelta(hours=1)
+    task = _terminal_task(session, company, TaskState.DONE, finished_at=just_finished)
+    node_modules = tmp_path / str(task.id) / REPO_DIRNAME / "node_modules"
+    (node_modules / "some-package").mkdir(parents=True)
+
+    reclaimed = reclaim_node_modules_for_terminal_tasks(
+        session, tmp_path, grace_period=dt.timedelta(hours=24)
+    )
+
+    assert reclaimed == 0
+    assert node_modules.exists()
+
+
+def test_reclaim_never_touches_a_failed_task(session, company, tmp_path) -> None:
+    """failed is still retry-eligible; a retry reusing the clone needs its
+    dependencies back, which would cost a fresh install this should not
+    force just by having run once."""
+    task = Task(
+        company_id=company.id,
+        type=TaskType.ENGINEERING,
+        title="x",
+        description="x",
+        rationale="x",
+    )
+    session.add(task)
+    session.flush()
+    old_enough = utcnow() - dt.timedelta(hours=48)
+    task.transition_to(TaskState.RUNNING)
+    task.transition_to(TaskState.FAILED, error="x", now=old_enough)
+    session.commit()
+
+    node_modules = tmp_path / str(task.id) / REPO_DIRNAME / "node_modules"
+    (node_modules / "some-package").mkdir(parents=True)
+
+    reclaimed = reclaim_node_modules_for_terminal_tasks(
+        session, tmp_path, grace_period=dt.timedelta(hours=24)
+    )
+
+    assert reclaimed == 0
+    assert node_modules.exists()
+
+
+def test_reclaim_is_a_no_op_when_there_is_nothing_to_reclaim(session, company, tmp_path) -> None:
+    old_enough = utcnow() - dt.timedelta(hours=48)
+    _terminal_task(session, company, TaskState.ABANDONED, finished_at=old_enough)
+    # No node_modules ever created for this task, e.g. a non-Node company.
+
+    reclaimed = reclaim_node_modules_for_terminal_tasks(
+        session, tmp_path, grace_period=dt.timedelta(hours=24)
+    )
+    assert reclaimed == 0
 
 
 def _make_workspace_from_local(tmp_path, profile, local_repo, monkeypatch, *, task_id: int) -> Path:

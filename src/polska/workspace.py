@@ -33,6 +33,7 @@ protected scraper paths named in a company's constraints.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import shutil
@@ -41,7 +42,13 @@ import subprocess
 from base64 import b64encode
 from pathlib import Path
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from polska.config.company import CompanyProfile
+from polska.db.enums import TaskState
+from polska.db.models import Task
+from polska.db.types import utcnow
 
 logger = logging.getLogger("polska.workspace")
 
@@ -151,6 +158,54 @@ def prepare_task_workspace(
     return task_workspace
 
 
+def reclaim_node_modules_for_terminal_tasks(
+    session: Session, workspace_root: Path, *, grace_period: dt.timedelta
+) -> int:
+    """Delete ``node_modules`` for any task that has sat in a terminal state
+    for at least ``grace_period``, keeping the rest of its workspace (the
+    source clone, any ``proposed/`` diff an engineer wrote) intact for
+    exactly as long as before. Returns how many workspaces were reclaimed.
+
+    ``node_modules`` is ~95%+ of a vendored workspace's size (measured:
+    393-428MB per task against a source clone of a few MB) and has zero
+    diagnostic value once a task is done with it: it is vendored public
+    packages, identical to what npm would fetch again, never anything
+    task-specific. The rest of the workspace is the one part worth being
+    able to look at after the fact, and this never touches it.
+
+    Never touches ``failed``: that state is still retry-eligible, and a
+    retry reusing the same clone (see ``prepare_task_workspace``'s own
+    idempotency check) would need its dependencies back, paying for an
+    install it did not need to pay for again if this had left it alone.
+
+    Call once per tick cycle, not once per company: this is a query across
+    every company's tasks, unrelated to any single one's tick.
+    """
+    cutoff = utcnow() - grace_period
+    terminal_tasks = session.execute(
+        select(Task).where(
+            Task.state.in_((TaskState.DONE, TaskState.ABANDONED, TaskState.BLOCKED)),
+            Task.finished_at < cutoff,
+        )
+    ).scalars()
+
+    reclaimed = 0
+    for task in terminal_tasks:
+        node_modules = workspace_root / str(task.id) / REPO_DIRNAME / "node_modules"
+        if not node_modules.exists():
+            continue
+        repo_dir = node_modules.parent
+        was_locked = not os.access(repo_dir, os.W_OK)
+        if was_locked:
+            repo_dir.chmod(0o755)
+        _force_rmtree(node_modules)
+        if was_locked:
+            repo_dir.chmod(0o555)
+        reclaimed += 1
+        logger.info("Reclaimed node_modules for terminal task %d.", task.id)
+    return reclaimed
+
+
 def _clone_read_only(
     repo_slug: str, branch: str, repo_dir: Path, secret_env_names: list[str], task_id: int
 ) -> None:
@@ -225,19 +280,34 @@ def _clone_read_only(
     _make_read_only(repo_dir)
 
 
+#: Written into node_modules only once the install subprocess actually
+#: returns success. Checking for this, not for node_modules itself,
+#: distinguishes a finished install from a partial one left behind by a
+#: process that died mid-install (killed, OOM'd, restarted): node_modules
+#: existing was already corrected once, from standing in for "a workspace
+#: was prepared before" (see this function's own docstring); this is the
+#: same correction applied one level deeper, to "the install that made it
+#: finished" rather than "something under this name exists".
+_VENDORED_MARKER_NAME = ".polska-vendored"
+
+
 def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
     """Install what a Node project's dependencies actually require to be
     present right now, checked directly rather than inferred from whether
     this looks like the first time a workspace has been prepared.
 
-    Keyed on whether ``node_modules`` exists, nothing else: a clone made
-    before this feature existed used to never get this call at all (see
-    ``prepare_task_workspace``'s own early return for an existing clone),
-    which meant "was a workspace already prepared" was silently standing in
-    for "does this workspace have what it needs", and a workspace could
-    satisfy the first without ever satisfying the second. Checking the real
-    condition means this runs, and self-heals, for an old clone exactly the
-    same way it does for a brand new one.
+    Keyed on whether ``node_modules/.polska-vendored`` exists, nothing else:
+    a clone made before this feature existed used to never get this call at
+    all (see ``prepare_task_workspace``'s own early return for an existing
+    clone), which meant "was a workspace already prepared" was silently
+    standing in for "does this workspace have what it needs", and a
+    workspace could satisfy the first without ever satisfying the second.
+    Checking the real condition means this runs, and self-heals, for an old
+    clone exactly the same way it does for a brand new one -- and the same
+    correction applies to ``node_modules`` existing at all: that alone means
+    "something was written here", not "the install that wrote it finished",
+    which a container killed mid-install would leave permanently
+    indistinguishable from a real one without the marker.
 
     Runs here, in Polska's own process, before the agent ever starts, on
     either a brand new clone or a years-old one -- the same "controlled step
@@ -251,11 +321,37 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
     isn't is an error, not a no-op.
     """
     node_modules = repo_dir / "node_modules"
-    if node_modules.exists():
+    marker = node_modules / _VENDORED_MARKER_NAME
+    if marker.exists():
         return
 
     if not (repo_dir / "package.json").exists():
         return
+
+    # repo_dir may already be locked read-only: an old clone _make_read_only
+    # already ran against, in a process that predated this function knowing
+    # to look for it. Both removing a partial node_modules and creating a
+    # fresh one need write access to repo_dir itself, so this is computed
+    # and acted on once, up front, covering either path below.
+    was_locked = not os.access(repo_dir, os.W_OK)
+    if was_locked:
+        repo_dir.chmod(0o755)
+
+    if node_modules.exists():
+        # No marker: either an install from before the marker existed, or
+        # one a process died in the middle of. Either way, node_modules
+        # existing is not the same claim as the marker existing, so this is
+        # not known-complete -- remove it and reinstall from scratch rather
+        # than layer a fresh install on top of an unknown partial one, which
+        # is exactly the "fails in a confusing way" a task working against
+        # missing files would produce.
+        logger.warning(
+            "Task %d's node_modules exists without a completion marker (a "
+            "partial install, or one that predates the marker); removing it "
+            "and reinstalling from scratch rather than trust it.",
+            task_id,
+        )
+        _force_rmtree(node_modules)
 
     lockfile = repo_dir / "package-lock.json"
     if lockfile.exists():
@@ -283,13 +379,6 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
         )
         command = ["npm", "install", "--no-audit", "--no-fund"]
 
-    # repo_dir may already be locked read-only: an old clone _make_read_only
-    # already ran against, in a process that predated this function knowing
-    # to look for it. npm needs to create node_modules inside it either way.
-    was_locked = not os.access(repo_dir, os.W_OK)
-    if was_locked:
-        repo_dir.chmod(0o755)
-
     try:
         subprocess.run(
             command,
@@ -312,6 +401,15 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
         if was_locked:
             repo_dir.chmod(0o555)
 
+    if not node_modules.exists():
+        return
+
+    # Written only once subprocess.run above has actually returned success:
+    # an exception from either except branch above returns out of this
+    # function entirely, so the marker's presence is a real claim, "an
+    # install finished here", not "an install was attempted here".
+    marker.write_text(f"{command[1]}\n", encoding="utf-8")
+
     # node_modules is vendored, not source: nothing under it needs the same
     # write protection as the repository the engineer must not edit, and a
     # test runner may need to write its own cache or temp output somewhere
@@ -319,14 +417,14 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
     # oversight: this directory holds public npm packages, never a secret or
     # a line of the company's own code, and the agent subprocess runs as a
     # different UID (see runner.py) with no group relationship to this one
-    # worth setting up just to avoid it.
-    if node_modules.exists():
-        node_modules.chmod(0o777)
-        for root, dirs, files in os.walk(node_modules):
-            for name in dirs:
-                (Path(root) / name).chmod(0o777)
-            for name in files:
-                (Path(root) / name).chmod(0o666)
+    # worth setting up just to avoid it. The marker file just written above
+    # is caught by this same loop, since it lives inside node_modules too.
+    node_modules.chmod(0o777)
+    for root, dirs, files in os.walk(node_modules):
+        for name in dirs:
+            (Path(root) / name).chmod(0o777)
+        for name in files:
+            (Path(root) / name).chmod(0o666)
 
 
 def _strip_low_value_files(repo_dir: Path) -> None:

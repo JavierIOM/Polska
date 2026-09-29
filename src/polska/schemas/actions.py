@@ -90,6 +90,16 @@ class AgentResult(BaseModel):
     blocked_reason: str = Field(default="", max_length=2000)
     #: Things the agent noticed but was not asked about. Fed to the next plan.
     observations: list[str] = Field(default_factory=list, max_length=20)
+    #: How many edit-and-verify cycles the engineer actually used, set
+    #: whether it stopped early because verification passed or because it
+    #: exhausted its bound (see prompts.py's _VERIFY_LOOP_BOUND). Optional
+    #: and unused by agents with no such loop (marketer, support, analyst):
+    #: shared on this schema rather than forked per-agent because the outcome
+    #: shape it supports, "tried N times, here is what happened each time",
+    #: is the same self-reported claim as failure_reason, just structured
+    #: enough to sanity-check against Run.tools_called after the fact rather
+    #: than trusted on its own.
+    iterations_attempted: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _outcome_is_explained_exactly_once(self) -> Self:

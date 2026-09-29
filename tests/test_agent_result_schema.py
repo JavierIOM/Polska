@@ -64,3 +64,19 @@ def test_a_success_cannot_carry_a_failure_reason() -> None:
 def test_a_success_cannot_carry_a_blocked_reason() -> None:
     with pytest.raises(ValidationError, match="Pick one"):
         AgentResult.model_validate(_result(succeeded=True, blocked_reason="but also this"))
+
+
+def test_iterations_attempted_defaults_to_unset() -> None:
+    assert AgentResult.model_validate(_result()).iterations_attempted is None
+
+
+def test_iterations_attempted_accepts_a_count() -> None:
+    result = AgentResult.model_validate(
+        _result(succeeded=False, failure_reason="did not converge", iterations_attempted=3)
+    )
+    assert result.iterations_attempted == 3
+
+
+def test_iterations_attempted_refuses_a_negative_count() -> None:
+    with pytest.raises(ValidationError):
+        AgentResult.model_validate(_result(iterations_attempted=-1))

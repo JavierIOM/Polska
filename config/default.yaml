@@ -29,6 +29,11 @@ limits:
   retry_base_delay_seconds: 900
   retry_backoff_multiplier: 2.0
   retry_max_delay_seconds: 14400
+  # A day, not immediate: node_modules is ~95%+ of a vendored workspace's
+  # size and has zero diagnostic value once a task is done, but same-day
+  # forensics on the rest of the workspace (the source clone, any diff an
+  # engineer wrote) stay possible for at least this long.
+  workspace_node_modules_grace_hours: 24
 
 budget:
   # Hard stops. Crossing one halts the scheduler and writes a BudgetHalt row.

@@ -58,6 +58,20 @@ class LimitsConfig(BaseModel):
     retry_backoff_multiplier: float = Field(default=2.0, ge=1.0)
     retry_max_delay_seconds: int = Field(default=14_400, ge=0)
 
+    #: How long a task stays in a terminal state (done/abandoned/blocked)
+    #: before its workspace's node_modules is reclaimed. node_modules is
+    #: ~95%+ of a vendored workspace's size (measured: 393-428MB per task
+    #: against a source clone of a few MB) and has zero diagnostic value
+    #: once a task is done with it, vendored public packages, identical to
+    #: what npm would fetch again, never anything task-specific. The rest
+    #: of the workspace (the source clone, any proposed/ diff an engineer
+    #: wrote) is left alone indefinitely: that is the part worth being able
+    #: to look at after the fact. A day, not immediate, so same-day
+    #: forensics stay possible without leaving disk growth effectively
+    #: unbounded -- at the daily task cap, unreclaimed node_modules would
+    #: otherwise accumulate at several GB/day.
+    workspace_node_modules_grace_hours: int = Field(default=24, ge=0)
+
     @model_validator(mode="after")
     def _retry_bounds_are_ordered(self) -> Self:
         if self.retry_base_delay_seconds > self.retry_max_delay_seconds:

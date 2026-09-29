@@ -5,6 +5,53 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-29
+
+Every engineer run traced this session was cut off by the token ceiling
+mid-attempt, never by finishing and being wrong, never by reporting a
+bounded failure, because nothing had ever told it there was a bound to
+reach. This is the fix for the actual finding of the investigation, plus
+two operational gaps found along the way.
+
+### Added
+
+- The engineer's edit-and-verify loop is now bounded at 3 cycles instead of
+  open-ended. `AgentResult.iterations_attempted` records how many it
+  actually used. Exhausting the bound without a passing result is an
+  ordinary `failed` outcome with a cycle-by-cycle `failure_reason`, ready
+  for the normal retry/backoff path, not a new state: retrying may
+  genuinely help here, unlike a ceiling-driven `interrupted`. Does not
+  weaken the verifiable-artefact requirement; gives the agent an honest way
+  to stop short of meeting it instead of the only alternatives being "keep
+  going until something external cuts the connection" or "claim success
+  anyway".
+- `reconcile_removed_companies`, run once per tick cycle: deactivates, and
+  abandons the open tasks of, any company whose profile file no longer
+  exists. `sync_company` now does the same the moment `active` flips
+  `true -> false` on an edit. Both close the same gap: dispatch only ever
+  happens inside a per-company tick, itself only ever entered for a company
+  whose profile is currently discovered, so a queued task under a removed
+  company was never actually reachable through the normal path, but that
+  protection was an accident of where dispatch happens to live, not a
+  decision anyone made, and would have stopped holding the moment that code
+  changed without anyone knowing this was relied on.
+- `node_modules` is now reclaimed automatically once a task has sat in a
+  terminal state for `limits.workspace_node_modules_grace_hours` (default
+  24). It is ~95%+ of a vendored workspace's size (measured: 393-428MB per
+  task) and has zero diagnostic value once a task is done with it; the rest
+  of the workspace is left alone indefinitely. At the daily task cap,
+  unreclaimed installs would otherwise accumulate at several GB/day.
+- A completion marker (`node_modules/.polska-vendored`) written only once
+  an install genuinely succeeds. `node_modules` existing was already
+  corrected once this session, from standing in for "a workspace was
+  prepared before"; this is the same correction one level deeper, to "the
+  install that made it finished" rather than "something under this name
+  exists" -- a container killed mid-install used to leave a partial tree
+  permanently indistinguishable from a real one. Found while answering
+  whether a short install is detectable, not hypothetically: the fix self-
+  heals by deleting and reinstalling rather than trusting a marker-less
+  `node_modules`.
+
 ## [0.5.4] - 2026-09-29
 
 ### Added

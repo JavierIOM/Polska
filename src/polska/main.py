@@ -29,6 +29,8 @@ from polska.db.base import make_engine, make_session_factory
 from polska.db.schema_check import assert_schema_is_current
 from polska.orchestrator import run_company_tick, run_startup_recovery
 from polska.runner import AgentRunner
+from polska.sync import reconcile_removed_companies
+from polska.workspace import reclaim_node_modules_for_terminal_tasks
 
 logger = logging.getLogger("polska.main")
 
@@ -42,6 +44,22 @@ async def _tick_all_companies(
 ) -> None:
     """Fired on every scheduler interval. Reloads profiles from disk each time, so
     an edited or newly added company YAML is picked up without a restart."""
+    with session_factory() as session:
+        abandoned = reconcile_removed_companies(session, companies_dir)
+        reclaimed = reclaim_node_modules_for_terminal_tasks(
+            session,
+            workspace_root,
+            grace_period=dt.timedelta(hours=app_config.limits.workspace_node_modules_grace_hours),
+        )
+    if abandoned:
+        logger.warning(
+            "Reconciled %d task(s) whose company's profile is no longer loaded.", abandoned
+        )
+    if reclaimed:
+        logger.info(
+            "Reclaimed node_modules for %d workspace(s) past their grace period.", reclaimed
+        )
+
     for path in discover_profiles(companies_dir):
         try:
             loaded = load_company_profile(path)

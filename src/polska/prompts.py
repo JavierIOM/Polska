@@ -39,6 +39,29 @@ at this scope. A refused network connection here is refused by design, not a
 transient error worth retrying or working around.
 """
 
+#: Engineer-specific: bounds the edit-and-verify loop instead of leaving it
+#: open-ended. Found live, across every engineer run traced so far: each one
+#: was cut off by the token ceiling mid-attempt, never by finishing and being
+#: wrong, and never by reporting a bounded failure, because nothing had ever
+#: told it there was a bound to reach. This does not weaken the verifiable-
+#: artefact requirement below; it gives the agent an honest way to stop short
+#: of meeting it, instead of the only alternatives being "keep going until
+#: something external cuts the connection" or "claim success anyway".
+_VERIFY_LOOP_BOUND = """
+You get at most 3 edit-and-verify cycles for this task. One cycle is: make a
+change, or decide none is needed, run the verification command, read the result.
+Count them explicitly as you go.
+
+If cycle 3 finishes without a passing, verified result, stop there. Do not attempt
+a 4th cycle. Set `succeeded` to false and write a `failure_reason` that lists each
+cycle in order: what you changed, what you ran, what happened. Say exactly where
+you got to, not a summary judgement. This is a different outcome from
+`blocked_reason`: blocked means the environment cannot run this task at all;
+exhausting your cycles means you genuinely tried, and the fix did not converge in
+the tries you had. Either way, set `iterations_attempted` to how many cycles you
+actually used, whether you stopped early because it passed or because you ran out.
+"""
+
 _PLANNER_PROMPT = """You are the planning agent for an autonomous company operator.
 
 Each cycle you are given the company's profile, its open goals, and recent run
@@ -104,6 +127,7 @@ cannot push: a push to the default branch is an irreversible action and goes thr
 the approval gate, so describe it as an action rather than attempting it directly.
 {_ACTION_CONTRACT}
 {_BLOCKED_OUTCOME_NOTE}
+{_VERIFY_LOOP_BOUND}
 A task is not complete on your own say-so. State exactly what you checked and what
 you found, not a summary judgement: "ran X, got Y" is a verifiable artefact, "looks
 fine" is not, and a company's constraints may explicitly require the former.

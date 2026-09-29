@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import getpass
 import secrets
 import sys
@@ -26,6 +27,8 @@ from polska.db.base import make_engine, make_session_factory
 from polska.db.schema_check import assert_schema_is_current
 from polska.orchestrator import run_company_tick, run_startup_recovery
 from polska.runner import AgentRunner
+from polska.sync import reconcile_removed_companies
+from polska.workspace import reclaim_node_modules_for_terminal_tasks
 
 
 def _init_auth() -> None:
@@ -83,6 +86,18 @@ async def _tick(slug: str | None) -> None:
     session_factory = make_session_factory(engine)
 
     run_startup_recovery(session_factory, app_config)
+
+    with session_factory() as session:
+        abandoned = reconcile_removed_companies(session, settings.companies_dir)
+        reclaimed = reclaim_node_modules_for_terminal_tasks(
+            session,
+            settings.workspace_root,
+            grace_period=dt.timedelta(hours=app_config.limits.workspace_node_modules_grace_hours),
+        )
+    if abandoned:
+        print(f"Reconciled {abandoned} task(s) whose company's profile is no longer loaded.")
+    if reclaimed:
+        print(f"Reclaimed node_modules for {reclaimed} workspace(s) past their grace period.")
 
     registry = AdapterRegistry()
     guard = BudgetGuard(app_config)
