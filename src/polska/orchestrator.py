@@ -28,8 +28,8 @@ from polska.activity import log
 from polska.budget import reconcile_orphaned_runs
 from polska.config.appconfig import AppConfig, LimitsConfig
 from polska.config.company import CompanyProfile, LoadedProfile
-from polska.db.enums import ActivityKind, AgentName, GoalStatus, TaskState, TaskType
-from polska.db.models import Goal, Task
+from polska.db.enums import ActivityKind, AgentName, GoalStatus, RunStatus, TaskState, TaskType
+from polska.db.models import Goal, Run, Task
 from polska.db.state import ACTIVE_STATES
 from polska.db.types import utcday, utcnow
 from polska.dedup import deduplicate
@@ -110,7 +110,52 @@ def is_retry_eligible(task: Task, limits: LimitsConfig, now: dt.datetime) -> boo
     return elapsed >= retry_delay_seconds(task.attempts, limits)
 
 
-def _build_planner_prompt(session: Session, company_id: int, open_goals: list[Goal]) -> str:
+#: Structured, per-task-safe reason for a concluded task's outcome, keyed by its
+#: most recent Run's status. Deliberately never the raw exception text a Run or
+#: Task.error might carry: that text can (and, in the incident this closes, did)
+#: describe a completely different run's cost figures -- a company-wide halt or
+#: another task's own ceiling -- which the planner then mined as if it were
+#: "the" budget figure. Nothing here ever contains a number.
+_RUN_STATUS_REASON: dict[RunStatus, str] = {
+    RunStatus.SUCCEEDED: "succeeded",
+    RunStatus.FAILED: "the agent reported failure",
+    RunStatus.TIMED_OUT: "timed out",
+    RunStatus.INTERRUPTED: "was cut off for exceeding its own run ceiling",
+    RunStatus.BUDGET_BLOCKED: (
+        "was blocked before it started by a budget ceiling or an open halt "
+        "(not necessarily one this task itself caused)"
+    ),
+    RunStatus.ORPHANED: "was interrupted by a process restart",
+    RunStatus.RECONCILED: "was interrupted by a process restart",
+    RunStatus.INVALID_OUTPUT: "produced output that did not validate",
+}
+
+
+def _task_outcome_reason(session: Session, task: Task) -> str:
+    """A structured, number-free description of why a concluded task ended the
+    way it did. See ``_RUN_STATUS_REASON`` for why this replaces raw error text.
+    """
+    if task.state == TaskState.DONE:
+        return ((task.result or {}).get("summary") or "")[:300]
+
+    if task.state == TaskState.ABANDONED:
+        # Already structured and specific to this task (see fail_or_abandon):
+        # "exceeded its own run ceiling", "attempts (n/m)", "cost ($/$ of this
+        # task's own ceiling)". Its dollar figure, when present, is this task's
+        # own spend against its own per-task ceiling, never another run's.
+        return (task.result or {}).get("abandoned_because") or "abandoned"
+
+    last_run = session.execute(
+        select(Run).where(Run.task_id == task.id).order_by(Run.started_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    if last_run is None:
+        return "failed before any run was attempted"
+    return _RUN_STATUS_REASON.get(last_run.status, "failed")
+
+
+def _build_planner_prompt(
+    session: Session, company_id: int, open_goals: list[Goal], runner: AgentRunner
+) -> str:
     lines = ["Open goals:"]
     if not open_goals:
         lines.append("  (none open)")
@@ -132,7 +177,7 @@ def _build_planner_prompt(session: Session, company_id: int, open_goals: list[Go
     any_recent = False
     for task in recent:
         any_recent = True
-        outcome = task.error or (task.result or {}).get("summary", "") or ""
+        outcome = _task_outcome_reason(session, task)
         lines.append(f"  - [{task.state.value}] {task.title}: {outcome}"[:300])
     if not any_recent:
         lines.append("  (none yet)")
@@ -150,6 +195,14 @@ def _build_planner_prompt(session: Session, company_id: int, open_goals: list[Go
     lines.append("")
     lines.append(
         f"Currently in flight: {active_count}. Queued, not yet dispatched: {queued_count}."
+    )
+
+    remaining_today = runner.budget_guard.remaining_today_usd(session, company_id)
+    lines.append("")
+    lines.append(
+        f"Remaining budget for today, the one figure to use for this: "
+        f"${remaining_today:.2f} (of the ${runner.budget_guard.budget.max_usd_per_day:.2f} "
+        "daily ceiling, after today's committed spend and anything already in flight)."
     )
     return "\n".join(lines)
 
@@ -222,7 +275,7 @@ async def run_company_tick(
             kind=ActivityKind.PLAN_STARTED,
             summary="Planning cycle started.",
         )
-        planner_prompt = _build_planner_prompt(session, company.id, open_goals)
+        planner_prompt = _build_planner_prompt(session, company.id, open_goals, runner)
         plan_outcome = await runner.run_planner(
             session, company_id=company.id, company_profile=profile, user_prompt=planner_prompt
         )

@@ -14,12 +14,33 @@ FROM python:3.12-slim
 # ca-certificates: the SDK's CLI makes real HTTPS calls to the Anthropic API.
 # Debian slim images are not guaranteed to have an up-to-date CA bundle out of
 # the box.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# git: workspace.py shells out to a real `git clone` for the engineer's task
+# workspace (see its module docstring). python:3.12-slim does not include it;
+# nothing here failed on that yet only because every tick has been failing
+# earlier, at CLI startup, before a workspace clone is ever reached.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
+
+# A non-root user, and specifically a *fixed* UID/GID rather than whatever
+# `useradd` would pick on its own: the Claude Code CLI refuses to run with
+# --dangerously-skip-permissions (what permission_mode="bypassPermissions"
+# becomes at the CLI level, see runner.py) as root, by the CLI's own design,
+# not a choice this project made -- see its own error, verbatim, for why this
+# user exists at all. A fixed, known UID is what lets the host-side bind
+# mount's ownership be matched deliberately instead of discovered by trial
+# and error; 1000 is the conventional first-regular-user UID on a fresh
+# Ubuntu box, overridable at build time if that ever collides with something
+# real on the host.
+ARG POLSKA_UID=1000
+ARG POLSKA_GID=1000
+RUN groupadd --gid ${POLSKA_GID} polska \
+    && useradd --uid ${POLSKA_UID} --gid ${POLSKA_GID} --create-home --shell /bin/bash polska
 
 WORKDIR /app
 
 # Dependencies first, so editing application code does not bust this layer.
+# Still as root: installing into site-packages needs it, and the non-root
+# user never needs to write there at runtime.
 COPY pyproject.toml ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir ".[runtime]"
@@ -35,6 +56,15 @@ COPY alembic.ini ./
 
 # companies/, config/ and data/ are bind-mounted by docker-compose, not baked
 # in here: editing a company profile or a ceiling should never need a rebuild.
+# Their in-image ownership below is irrelevant once a bind mount replaces
+# them at `docker compose up` time -- the mount's write access is decided
+# entirely by the *host-side* directory's ownership, not anything set here.
+# This chown only matters for the parts of /app that stay baked into the
+# image (src/, migrations/, alembic.ini) and for running this image without
+# compose at all.
+RUN mkdir -p data companies config && chown -R polska:polska /app
+
+USER polska
 
 # No CMD: docker-compose.yml sets the command per service (scheduler vs
 # dashboard). Running this image with no command is deliberately not useful.

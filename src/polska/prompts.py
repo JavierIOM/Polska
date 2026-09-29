@@ -36,7 +36,13 @@ it anyway and say so in its rationale rather than silently dropping it, since a
 separate deduplication step exists downstream and does that job with more care than
 you have context for.
 
-Never invent a goal that was not given to you."""
+Never invent a goal that was not given to you.
+
+Never cite a number that was not explicitly given to you in this prompt, especially a
+dollar figure. If you want to reason about remaining budget, use the one figure
+labelled as such below, or say you don't know it. A number that appears anywhere else
+in this prompt (an outcome description, a task title) describes something else
+entirely and is never a substitute."""
 
 _DEDUP_JUDGE_PROMPT = """You are a deduplication judge for an autonomous company
 operator's task planner.

@@ -127,6 +127,47 @@ async def test_reserving_past_the_daily_ceiling_is_refused(
     assert excinfo.value.halt.scope == BudgetScope.DAY
 
 
+async def test_remaining_today_usd_reflects_committed_and_reserved_spend(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    """The planner's one source of truth: exactly what `reserve` would check
+    against, not a separately derived figure."""
+    guard = BudgetGuard(tight_config)
+    assert guard.remaining_today_usd(session, company.id) == tight_config.budget.max_usd_per_day
+
+    reservation = await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
+    assert guard.remaining_today_usd(session, company.id) == pytest.approx(
+        tight_config.budget.max_usd_per_day - reservation.usd
+    )
+
+    guard.release(reservation)
+    assert guard.remaining_today_usd(session, company.id) == tight_config.budget.max_usd_per_day
+
+
+async def test_remaining_today_usd_can_go_negative_after_an_overshoot(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    """An open halt does not zero this out; it can be negative, which is the
+    honest answer to "how much is left" when the day already went over."""
+    guard = BudgetGuard(tight_config)
+    await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
+    await guard.reserve(
+        session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+    )
+    with pytest.raises(BudgetExceeded):
+        await guard.reserve(
+            session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
+    # The refused reservation released itself (see reserve()'s `finally`-free
+    # raise path -- nothing was ever added to _reservations for it), so this
+    # reflects only the two that were actually granted.
+    assert guard.remaining_today_usd(session, company.id) == pytest.approx(0.5)
+
+
 async def test_a_refused_reservation_writes_a_budget_halt(
     session: Session, tight_config: AppConfig, company: Company
 ) -> None:

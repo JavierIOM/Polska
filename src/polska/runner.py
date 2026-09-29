@@ -265,6 +265,13 @@ class AgentRunner:
         self._adapters = adapter_registry
         self._query_fn = query_fn
 
+    @property
+    def budget_guard(self) -> BudgetGuard:
+        """The one instance every dispatch reserves against. Exposed so the
+        planner prompt can quote its actual remaining-budget figure instead of
+        a separately derived one -- see orchestrator._build_planner_prompt."""
+        return self._budget
+
     async def run_planner(
         self,
         session: Session,

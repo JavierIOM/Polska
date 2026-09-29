@@ -13,6 +13,7 @@ import datetime as dt
 import pytest
 from claude_agent_sdk import CLIConnectionError, ResultMessage
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from polska.adapters.registry import AdapterRegistry
 from polska.budget import BudgetGuard
@@ -22,6 +23,7 @@ from polska.db.enums import ActivityKind, TaskState, TaskType
 from polska.db.models import ActivityEvent, Company, Goal, Task
 from polska.db.types import utcnow
 from polska.orchestrator import (
+    _build_planner_prompt,
     _build_worker_prompt,
     is_retry_eligible,
     retry_delay_seconds,
@@ -93,6 +95,59 @@ def test_the_worker_prompt_includes_the_goal_s_own_description(session, company:
     assert "auction-data-freshness" in prompt
     assert "deliberately excluded" in prompt
     assert "3/5 sources" in prompt  # the numbers are still there too
+
+
+# ------------------------------------------------------------------ planner prompt
+
+
+def test_planner_prompt_never_echoes_a_run_s_raw_error_text(
+    session: Session, app_config: AppConfig, company: Company, task: Task
+) -> None:
+    """The exact incident this closes: a FAILED task's most recent Run can carry
+    an unrelated run's dollar figures in its error text (a company-wide halt, or
+    another run's own ceiling), and the planner previously saw that raw text
+    verbatim and mined a number out of it that had nothing to do with today's
+    actual remaining budget. The prompt must carry a structured reason instead,
+    never the sentence itself."""
+    from polska.db.enums import RunStatus
+    from polska.db.models import Run
+
+    task.transition_to(TaskState.RUNNING)
+    misleading_error = (
+        "run ceiling 'mid_run_watchdog' would be crossed: $0.3849 against a limit "
+        "of $1.00. Run 8: Cut off mid-stream: 639589 tokens spent against a 600000 "
+        "token run ceiling."
+    )
+    session.add(
+        Run(
+            company_id=company.id,
+            task_id=task.id,
+            agent="support",
+            model="claude-sonnet-5",
+            status=RunStatus.BUDGET_BLOCKED,
+            error=misleading_error,
+        )
+    )
+    task.transition_to(TaskState.FAILED, error=misleading_error)
+    session.commit()
+
+    runner = AgentRunner(
+        app_config=app_config, budget_guard=BudgetGuard(app_config), adapter_registry=None
+    )
+    prompt = _build_planner_prompt(session, company.id, [], runner)
+
+    assert "0.3849" not in prompt
+    assert "mid_run_watchdog" not in prompt
+    assert "blocked before it started" in prompt
+
+
+def test_planner_prompt_states_todays_actual_remaining_budget(
+    session: Session, app_config: AppConfig, company: Company
+) -> None:
+    guard = BudgetGuard(app_config)
+    runner = AgentRunner(app_config=app_config, budget_guard=guard, adapter_registry=None)
+    prompt = _build_planner_prompt(session, company.id, [], runner)
+    assert f"${app_config.budget.max_usd_per_day:.2f}" in prompt
 
 
 def test_a_non_failed_task_is_never_retry_eligible(task: Task) -> None:
@@ -183,6 +238,10 @@ class _ScriptedRunner:
         self._registry = AdapterRegistry()
         self._budget = BudgetGuard(app_config)
         self._app_config = app_config
+
+    @property
+    def budget_guard(self) -> BudgetGuard:
+        return self._budget
 
     def _make_runner(self, output: object) -> AgentRunner:
         async def fake(*, prompt: str, options: object):

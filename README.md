@@ -309,8 +309,18 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
    ```
    git clone <this repo's URL> polska && cd polska
    mkdir -p data
+   sudo chown -R 1000:1000 data
    cp .env.example .env
    ```
+   The container runs as a non-root user, fixed at UID/GID 1000 in the
+   `Dockerfile` (the Claude Code CLI refuses `--dangerously-skip-permissions`,
+   what `permission_mode="bypassPermissions"` becomes at the CLI level, for
+   root — see `runner.py`). `data/` is bind-mounted, so *its* write access is
+   decided entirely by this host-side ownership, not anything set inside the
+   image; skip the `chown` and the scheduler's very first write to
+   `data/polska.db` fails with a permission error instead of a missing-file
+   one. `companies/` and `config/` don't need it: the app only ever reads
+   them, and a plain `git clone` already leaves them world-readable.
 
 3. **Put a real `ANTHROPIC_API_KEY` in `.env`.** Leave `POLSKA_ADMIN_PASSWORD_HASH`
    and `POLSKA_SESSION_SECRET` blank for now; the next steps generate them.
@@ -363,6 +373,20 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
    (`python -m polska.cli tick carscratch`) to run just it. This is the exact same
    `run_company_tick` call the scheduler makes on its own interval, run once, now,
    and it prints the same summary line `scripts/observe_ticks.py` does.
+
+### Upgrading a deployment that predates the non-root container user
+
+Every file under `data/` on the host — the database, any workspace clones —
+was written by the container running as root, so it is owned by root on the
+host. Rebuilding the image without fixing this leaves the new, non-root
+container unable to write to any of it. Before pulling the fix:
+```
+docker compose down
+sudo chown -R 1000:1000 data
+docker compose build
+docker compose up -d
+```
+Nothing under `companies/` or `config/` needs this: the app only reads them.
 
 ### What each container actually restarts on
 

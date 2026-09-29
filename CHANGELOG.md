@@ -5,6 +5,42 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-09-29
+
+Found running the real deployment: every tick was failing, and the planner had
+already reasoned itself into an incorrect budget figure before this was caught.
+
+### Fixed
+
+- The scheduler could not run any agent at all. The container ran as root, and
+  the Claude Code CLI refuses `--dangerously-skip-permissions` (what
+  `permission_mode="bypassPermissions"` becomes at the CLI level, see
+  `runner.py`) for root, by the CLI's own design. `Dockerfile` now creates a
+  fixed-UID (1000) non-root user and runs as it. `permission_mode` itself is
+  unchanged — the tool allowlist stays the security boundary, this only fixes
+  who the process is. Also installs `git`, never actually present in the
+  image before now: `workspace.py` shells out to it for the engineer/analyst
+  task workspace, and nothing had reached that code path yet only because
+  every tick was failing earlier, at CLI startup. See README's new
+  "Upgrading a deployment that predates the non-root container user" section
+  — every file already under `data/` on a running droplet is root-owned on
+  the host and needs a one-time `chown` before this rebuild, or the new
+  non-root container cannot write to its own database.
+- The planner was given no real budget figure and, separately, was shown raw
+  exception text as a task's "recent outcome" — text that can (and did)
+  describe a completely unrelated run's cost ceiling, which it then mined a
+  dollar figure out of and reported as "remaining budget for this cycle,"
+  wrongly, while `max_usd_per_day` had a lot of room left. Fixed in two
+  parts, deliberately not one: `BudgetGuard.remaining_today_usd`, the exact
+  figure `reserve()` itself checks against, is now the one number the
+  planner is given for "how much is left today"; and a concluded task's
+  outcome is now a structured, number-free reason
+  (`orchestrator._task_outcome_reason`, keyed off the task's own last `Run`
+  status) rather than its raw `error` text, so a task requeued after being
+  blocked by someone else's halt can never again surface that halt's figures
+  as if they were its own. The planner's system prompt also now states the
+  rule directly: never cite a number not explicitly given in the prompt.
+
 ## [0.4.2] - 2026-09-28
 
 Two more found running the real deployment.

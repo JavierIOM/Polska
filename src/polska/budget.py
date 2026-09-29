@@ -290,6 +290,22 @@ class BudgetGuard:
             self._reservations[reservation.id] = reservation
             return reservation
 
+    def remaining_today_usd(self, session: Session, company_id: int) -> float:
+        """Today's daily ceiling minus committed spend and in-flight reservations:
+        the exact figure :meth:`reserve` checks against, not a separate estimate.
+
+        The planner's one source of truth for "how much is left today" -- found
+        the hard way: it was previously given no such figure at all, and once
+        mis-quoted an unrelated run's cost ceiling as this number. Can be
+        negative (an open halt does not zero this out, it just means the last
+        reservation that crossed it never got to spend).
+        """
+        today = utcday()
+        committed_or_reserved = _actual_usd(
+            session, company_id, since_day=today
+        ) + self._reserved_usd(company_id)
+        return self.budget.max_usd_per_day - committed_or_reserved
+
     def release(self, reservation: Reservation) -> None:
         """Give back a reservation. Safe to call more than once; the second call
         finds nothing and does nothing, which matters in a ``finally`` block that
