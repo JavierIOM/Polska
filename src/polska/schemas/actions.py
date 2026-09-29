@@ -72,23 +72,52 @@ class AgentResult(BaseModel):
     output: dict[str, Any] = Field(default_factory=dict)
     #: External effects the agent wants performed. May be empty.
     actions: list[ActionRequest] = Field(default_factory=list, max_length=20)
-    #: Set when ``succeeded`` is false.
+    #: Set when ``succeeded`` is false and the work was attempted but did not
+    #: come out right. Never set alongside ``blocked_reason``: those are two
+    #: different claims about what happened, not two ways to phrase one.
     failure_reason: str = Field(default="", max_length=2000)
+    #: Set when ``succeeded`` is false because this task cannot be executed in
+    #: this environment at all -- no runtime to run a test, no way to verify a
+    #: change -- distinct from a failed attempt. Found live: an engineer task
+    #: with a genuinely narrow, single-file scope still burned most of its run
+    #: ceiling because the container had no way to run the TypeScript it was
+    #: asked to verify, and instead of reporting that, it copied the file out
+    #: of the read-only clone and improvised a workaround. This field exists so
+    #: the next one says "I cannot verify this here" instead. Retrying an
+    #: environment-blocked task at the same scope cannot ever help, so it goes
+    #: straight to TaskState.BLOCKED rather than through the ordinary
+    #: attempts/cost retry path.
+    blocked_reason: str = Field(default="", max_length=2000)
     #: Things the agent noticed but was not asked about. Fed to the next plan.
     observations: list[str] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
-    def _failure_is_explained(self) -> Self:
-        if not self.succeeded and not self.failure_reason.strip():
+    def _outcome_is_explained_exactly_once(self) -> Self:
+        failure_set = bool(self.failure_reason.strip())
+        blocked_set = bool(self.blocked_reason.strip())
+
+        if self.succeeded:
+            if failure_set or blocked_set:
+                raise ValueError(
+                    "The agent reported success but also gave a failure_reason or "
+                    "blocked_reason. Pick one: an ambiguous result would be recorded "
+                    "as a success and the warning lost."
+                )
+            return self
+
+        if failure_set and blocked_set:
             raise ValueError(
-                "The agent reported failure without a failure_reason. A task that "
-                "failed for no stated reason cannot be retried intelligently or "
-                "abandoned confidently."
+                "The agent set both failure_reason and blocked_reason. These are "
+                "different claims (an attempt that didn't work, versus an "
+                "environment that cannot run this task at all) and only one can "
+                "be true. Pick the one that actually happened."
             )
-        if self.succeeded and self.failure_reason.strip():
+        if not failure_set and not blocked_set:
             raise ValueError(
-                "The agent reported success but also gave a failure_reason. Pick one: "
-                "an ambiguous result would be recorded as a success and the warning lost."
+                "The agent reported failure without a failure_reason or "
+                "blocked_reason. A task that failed for no stated reason cannot "
+                "be retried intelligently, abandoned confidently, or recognised "
+                "as unexecutable here."
             )
         return self
 
@@ -96,3 +125,9 @@ class AgentResult(BaseModel):
     def has_actions(self) -> bool:
         """True if this result wants something done to the outside world."""
         return bool(self.actions)
+
+    @property
+    def is_environment_blocked(self) -> bool:
+        """True if the agent reported this task as unexecutable here, rather
+        than attempted and failed."""
+        return bool(self.blocked_reason.strip())

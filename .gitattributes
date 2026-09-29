@@ -1,0 +1,8 @@
+# Shell scripts run inside the Linux container and on the droplet directly.
+# A CRLF line ending turns `#!/bin/sh` into a broken interpreter line, so
+# these must always be stored and checked out as LF, regardless of whatever
+# core.autocrlf a contributor's own machine has set -- found the hard way
+# once already this project (docker-compose.yml verified on Linux before
+# Javier's first real run, specifically for this class of problem).
+*.sh text eol=lf
+Dockerfile text eol=lf

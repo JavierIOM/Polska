@@ -50,7 +50,9 @@ TASK_TYPE_TO_AGENT: dict[TaskType, AgentName] = {
 }
 
 #: States a "recent outcomes" query looks at: work that has actually concluded.
-_CONCLUDED_STATES = frozenset({TaskState.DONE, TaskState.FAILED, TaskState.ABANDONED})
+_CONCLUDED_STATES = frozenset(
+    {TaskState.DONE, TaskState.FAILED, TaskState.ABANDONED, TaskState.BLOCKED}
+)
 
 #: Task types that get a repo clone in their workspace. Research needs to read
 #: real code as much as engineering does, arguably more: every worker mapped to
@@ -144,6 +146,16 @@ def _task_outcome_reason(session: Session, task: Task) -> str:
         # task's own ceiling)". Its dollar figure, when present, is this task's
         # own spend against its own per-task ceiling, never another run's.
         return (task.result or {}).get("abandoned_because") or "abandoned"
+
+    if task.state == TaskState.BLOCKED:
+        # The agent's own stated reason the environment could not run this at
+        # all, e.g. "no TypeScript runtime available to verify the change".
+        # Distinct from a failure: retrying will not change this, only fixing
+        # the environment (or deciding not to) will, and this line exists so
+        # the planner stops proposing the same doomed work rather than
+        # treating it as ordinary flaky work worth another attempt.
+        reason = (task.result or {}).get("blocked_reason") or "not executable here"
+        return f"blocked, not executable in this environment: {reason}"
 
     last_run = session.execute(
         select(Run).where(Run.task_id == task.id).order_by(Run.started_at.desc()).limit(1)

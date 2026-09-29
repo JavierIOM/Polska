@@ -30,6 +30,14 @@ class TaskState(StrEnum):
     DONE = "done"
     FAILED = "failed"
     ABANDONED = "abandoned"
+    #: The agent determined the environment cannot execute this task at all (no
+    #: runtime to run a test, no way to verify a change), and said so, rather than
+    #: retrying identically or improvising a workaround. Deliberately distinct from
+    #: FAILED/ABANDONED: those mean the work was attempted and didn't succeed;
+    #: BLOCKED means the work was never executable here, which is a fact about the
+    #: environment, not the task or the attempt. See AgentResult.blocked_reason and
+    #: RunStatus.ENVIRONMENT_BLOCKED.
+    BLOCKED = "blocked"
 
 
 class AgentName(StrEnum):

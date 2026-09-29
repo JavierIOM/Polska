@@ -92,7 +92,10 @@ async def main() -> None:
     adapter_registry = AdapterRegistry()
     budget_guard = BudgetGuard(app_config)
     runner = AgentRunner(
-        app_config=app_config, budget_guard=budget_guard, adapter_registry=adapter_registry
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=adapter_registry,
+        agent_cli_path=settings.resolved_agent_cli_wrapper_path(),
     )
 
     scheduler = AsyncIOScheduler()

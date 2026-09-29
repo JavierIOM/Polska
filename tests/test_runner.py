@@ -361,6 +361,48 @@ async def test_a_worker_reporting_failure_moves_the_task_to_failed(
     assert task.error == "no context"
 
 
+async def test_a_worker_reporting_an_environment_block_moves_the_task_to_blocked(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """Distinct from an ordinary failure: found live, an engineer task with a
+    genuinely narrow scope burned most of its run ceiling because the container
+    had no runtime to verify a TypeScript change, and instead of reporting that,
+    it improvised a workaround. This is the path that lets the next one report
+    it instead."""
+    output = {
+        "succeeded": False,
+        "summary": "Cannot verify this change.",
+        "blocked_reason": "No Node/npm runtime available to run the test suite.",
+    }
+    result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.ENGINEER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Implement the signal.",
+    )
+
+    session.refresh(task)
+    assert task.state == TaskState.BLOCKED
+    assert task.is_terminal
+    assert task.result["blocked_reason"] == "No Node/npm runtime available to run the test suite."
+    # Not routed through fail_or_abandon: attempts is not what decides this.
+    assert task.attempts == 1
+
+
 async def test_a_worker_proposing_an_irreversible_action_parks_the_task(
     session,
     app_config: AppConfig,

@@ -39,6 +39,7 @@ LEGAL_PAIRS = {
     (TaskState.RUNNING, TaskState.DONE),
     (TaskState.RUNNING, TaskState.FAILED),
     (TaskState.RUNNING, TaskState.ABANDONED),
+    (TaskState.RUNNING, TaskState.BLOCKED),
     (TaskState.AWAITING_APPROVAL, TaskState.RUNNING),
     (TaskState.AWAITING_APPROVAL, TaskState.DONE),
     (TaskState.AWAITING_APPROVAL, TaskState.FAILED),
@@ -71,10 +72,11 @@ def test_no_state_transitions_to_itself(state: TaskState) -> None:
     assert not can_transition(state, state)
 
 
-def test_terminal_states_are_done_and_abandoned() -> None:
-    assert TERMINAL_STATES == {TaskState.DONE, TaskState.ABANDONED}
+def test_terminal_states_are_done_abandoned_and_blocked() -> None:
+    assert TERMINAL_STATES == {TaskState.DONE, TaskState.ABANDONED, TaskState.BLOCKED}
     assert is_terminal(TaskState.DONE)
     assert is_terminal(TaskState.ABANDONED)
+    assert is_terminal(TaskState.BLOCKED)
     assert not is_terminal(TaskState.QUEUED)
 
 
@@ -103,11 +105,11 @@ def test_dedup_lookback_states_is_done_only() -> None:
     assert DEDUP_LOOKBACK_STATES == {TaskState.DONE}
 
 
-def test_abandoned_never_suppresses_a_new_proposal() -> None:
-    """The one state that must never haunt a future proposal. A task that was
-    abandoned means the system tried and gave up: the underlying need is still open,
-    and a fresh attempt at it is correct behaviour, not duplicate work."""
-    assert DEDUP_NEVER_SUPPRESSES == {TaskState.ABANDONED}
+def test_abandoned_and_blocked_never_suppress_a_new_proposal() -> None:
+    """The two states that must never haunt a future proposal. ABANDONED means
+    the system tried and gave up: the underlying need is still open. BLOCKED means
+    the environment couldn't run it at all, which may no longer be true later."""
+    assert DEDUP_NEVER_SUPPRESSES == {TaskState.ABANDONED, TaskState.BLOCKED}
 
 
 def test_the_three_dedup_sets_partition_every_state_with_no_overlap() -> None:
@@ -272,6 +274,21 @@ def test_approval_round_trip_resumes_the_task(session: Session, task: Task) -> N
     # Resuming after approval must not be counted as a fresh attempt at the work.
     assert task.attempts == 2
     assert task.state == TaskState.DONE
+
+
+def test_transition_to_blocked_is_terminal_and_takes_a_result(
+    session: Session, task: Task
+) -> None:
+    task.transition_to(TaskState.RUNNING)
+    task.transition_to(
+        TaskState.BLOCKED, result={"blocked_reason": "no runtime to verify this"}
+    )
+    session.commit()
+
+    assert task.state == TaskState.BLOCKED
+    assert task.is_terminal
+    assert task.finished_at is not None
+    assert task.result == {"blocked_reason": "no runtime to verify this"}
 
 
 def test_rejection_abandons_the_task(session: Session, task: Task) -> None:

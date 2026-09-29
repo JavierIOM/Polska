@@ -51,6 +51,7 @@ logger = logging.getLogger("polska.workspace")
 REPO_DIRNAME = "repo"
 
 _CLONE_TIMEOUT_SECONDS = 120
+_NPM_CI_TIMEOUT_SECONDS = 300
 
 #: Dependency lockfiles: never useful to an agent doing product work, often huge
 #: (CarScratch's own package-lock.json is 478KB, ~120k tokens on its own), and
@@ -105,6 +106,15 @@ def prepare_task_workspace(
     """
     task_workspace = workspace_root / str(task_id)
     task_workspace.mkdir(parents=True, exist_ok=True)
+    # Created by this process (the orchestrator, running as one user), but the
+    # actual agent subprocess runs as a different, unprivileged user with no
+    # network access (see runner.py's cli_path); a plain mkdir's default mode
+    # leaves "other" with no write bit, which would make this directory --
+    # the one place the agent is actually meant to write scratch files, a
+    # proposed/ copy of a change, a diff -- unwritable to it. World-writable
+    # is a deliberate simplification, not an oversight: this is ephemeral,
+    # per-task scratch space, never a secret or the company's own source.
+    task_workspace.chmod(0o777)
 
     github = company_profile.integrations.get("github")
     if github is None or not github.enabled:
@@ -193,18 +203,85 @@ def _clone_read_only(
                 "its .git directory still exists."
             )
 
+    _vendor_node_dependencies(repo_dir, task_id)
     _strip_low_value_files(repo_dir)
     _make_read_only(repo_dir)
+
+
+def _vendor_node_dependencies(repo_dir: Path, task_id: int) -> None:
+    """Install exactly what ``package-lock.json`` specifies, once, before the
+    workspace is ever handed to an agent.
+
+    Runs here, in Polska's own process, before the clone is stripped and
+    locked read-only -- the same "controlled step outside the agent's own
+    execution" the credential injection above already relies on. This is the
+    one legitimate place a real network call to fetch a dependency happens;
+    the agent's own subprocess, run under a separate, network-restricted
+    user, never reaches the registry itself.
+
+    ``npm ci`` (not ``npm install``): deterministic against the committed
+    lockfile, and it refuses outright if the lockfile and package.json have
+    drifted, rather than silently resolving something slightly different from
+    what the repository's own CI would install.
+
+    Skipped entirely when there is no ``package-lock.json``: not every
+    company's repository is a Node project, and running ``npm ci`` against
+    one that isn't is an error, not a no-op.
+    """
+    lockfile = repo_dir / "package-lock.json"
+    if not lockfile.exists():
+        return
+
+    try:
+        subprocess.run(
+            ["npm", "ci", "--no-audit", "--no-fund"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            timeout=_NPM_CI_TIMEOUT_SECONDS,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode(errors="replace") if exc.stderr else ""
+        raise WorkspaceError(
+            f"npm ci failed for task {task_id}'s workspace: {stderr[:500]}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError(
+            f"npm ci for task {task_id}'s workspace did not finish within "
+            f"{_NPM_CI_TIMEOUT_SECONDS}s."
+        ) from exc
+
+    # node_modules is vendored, not source: nothing under it needs the same
+    # write protection as the repository the engineer must not edit, and a
+    # test runner may need to write its own cache or temp output somewhere
+    # inside it. World-writable is a deliberate simplification, not an
+    # oversight: this directory holds public npm packages, never a secret or
+    # a line of the company's own code, and the agent subprocess runs as a
+    # different UID (see runner.py) with no group relationship to this one
+    # worth setting up just to avoid it.
+    node_modules = repo_dir / "node_modules"
+    if node_modules.exists():
+        node_modules.chmod(0o777)
+        for root, dirs, files in os.walk(node_modules):
+            for name in dirs:
+                (Path(root) / name).chmod(0o777)
+            for name in files:
+                (Path(root) / name).chmod(0o666)
 
 
 def _strip_low_value_files(repo_dir: Path) -> None:
     """Remove lockfiles and binary assets, and warn about anything else large.
 
     Called before ``_make_read_only``, since these are real deletions and need
-    write access to do.
+    write access to do. Skips ``node_modules`` entirely: vendored dependencies
+    are not the low-value noise this exists to trim (see
+    ``_vendor_node_dependencies``), and a binary asset a package genuinely
+    needs at runtime, an icon, a compiled native addon, must survive here.
     """
     removed_bytes = 0
     for path in list(repo_dir.rglob("*")):
+        if "node_modules" in path.parts:
+            continue
         if not path.is_file():
             continue
         if path.name in _LOCKFILE_NAMES or path.suffix.lower() in _BINARY_EXTENSIONS:
@@ -260,8 +337,16 @@ def _basic_auth(token: str) -> str:
 
 def _make_read_only(path: Path) -> None:
     """Best-effort write-protection for the whole tree. See the module docstring:
-    this is complete on the Linux deployment target and partial on Windows."""
+    this is complete on the Linux deployment target and partial on Windows.
+
+    Never descends into ``node_modules``: see ``_vendor_node_dependencies``,
+    which deliberately leaves it writable so a test runner has somewhere to
+    put its own cache or temp output, and skips its chmod here entirely
+    rather than lock it down and immediately contradict that.
+    """
     for root, dirs, files in os.walk(path):
+        if "node_modules" in dirs:
+            dirs.remove("node_modules")
         for name in files:
             (Path(root) / name).chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
         for name in dirs:

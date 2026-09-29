@@ -259,11 +259,17 @@ class AgentRunner:
         budget_guard: BudgetGuard,
         adapter_registry: AdapterRegistry,
         query_fn: QueryFn = sdk_query,
+        agent_cli_path: str | None = None,
     ) -> None:
         self._config = app_config
         self._budget = budget_guard
         self._adapters = adapter_registry
         self._query_fn = query_fn
+        # Every agent invocation this instance makes is pointed at this path
+        # instead of the SDK's own CLI discovery, when set. See
+        # Settings.resolved_agent_cli_wrapper_path for what verifies it
+        # actually exists before this ever gets here.
+        self._agent_cli_path = agent_cli_path
 
     @property
     def budget_guard(self) -> BudgetGuard:
@@ -328,10 +334,13 @@ class AgentRunner:
         """Run a worker agent (engineer, marketer, support, analyst) against a task.
 
         Owns the task's transition out of ``queued``: it moves to ``running`` before
-        the call and to one of ``done``, ``awaiting_approval``, ``failed`` or
-        ``abandoned`` after, depending on what the agent returned, what the gate did
-        with any actions it proposed, and whether this was the task's last permitted
-        attempt (see :meth:`fail_or_abandon`). The caller decides *whether* to run
+        the call and to one of ``done``, ``awaiting_approval``, ``failed``,
+        ``abandoned`` or ``blocked`` after, depending on what the agent returned,
+        what the gate did with any actions it proposed, and whether this was the
+        task's last permitted attempt (see :meth:`fail_or_abandon`). ``blocked``
+        is distinct from the other outcomes: it means the agent reported that this
+        environment cannot execute the task at all, not that it tried and failed
+        (see :meth:`_block_as_not_executable`). The caller decides *whether* to run
         this task; this method is what actually running it means.
         """
         task.transition_to(TaskState.RUNNING)
@@ -356,6 +365,10 @@ class AgentRunner:
                 outcome.run.error or "The agent's output did not validate.",
                 run_status=outcome.run.status,
             )
+            return outcome
+
+        if result.is_environment_blocked:
+            self._block_as_not_executable(session, task, result.blocked_reason)
             return outcome
 
         if not result.succeeded:
@@ -385,6 +398,35 @@ class AgentRunner:
             task.transition_to(TaskState.DONE, result=task_result)
         session.commit()
         return outcome
+
+    def _block_as_not_executable(self, session: Session, task: Task, reason: str) -> None:
+        """Move a task straight to ``blocked``: the agent reported that this
+        environment cannot execute it at all, not that it tried and failed.
+
+        Never routed through :meth:`fail_or_abandon`, and never subject to
+        ``limits.max_attempts`` or ``budget.max_usd_per_task``: those exist to
+        decide whether *another attempt* is worth paying for, which only makes
+        sense for a task that could plausibly succeed on a retry. An
+        environment gap does not go away because the same task is dispatched
+        again at the same scope; a human fixing the gap (or deciding it can't
+        be fixed) is the only thing that changes the answer. This is exactly
+        the case ``run_worker``'s docstring means by "reports rather than
+        improvises" -- the fix for the failure mode this closes is not a
+        retry policy, it is the agent choosing to stop and say so.
+        """
+        task.transition_to(
+            TaskState.BLOCKED,
+            result={"blocked_reason": reason, "attempts": task.attempts},
+        )
+        summary = f"Blocked, not executable in this environment: {reason}"
+        session.commit()
+        log(
+            session,
+            company_id=task.company_id,
+            kind=ActivityKind.TASK_STATE_CHANGED,
+            summary=summary,
+            task_id=task.id,
+        )
 
     def fail_or_abandon(
         self,
@@ -636,6 +678,14 @@ class AgentRunner:
             model=model,
             max_turns=agent_config.max_turns,
             cwd=str(cwd) if cwd is not None else None,
+            # Every agent invocation, unconditionally, not just the ones with
+            # Bash or WebFetch in their tool allowlist: one boundary regardless
+            # of which agent runs is simpler to reason about and audit than
+            # "only the ones that could plausibly reach the network" ever was.
+            # None outside the container (see Settings.agent_cli_wrapper_path),
+            # which leaves the SDK's own CLI discovery, unrestricted, exactly
+            # as before this existed.
+            cli_path=self._agent_cli_path,
             output_format={"type": "json_schema", "schema": schema},
             # The SDK's own enforcement of the same figure the reservation holds.
             # Real, but not exact: measured directly, a run has still spent 5% over

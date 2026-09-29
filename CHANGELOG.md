@@ -5,6 +5,41 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-29
+
+Found running the real deployment: an engineer task with a genuinely narrow,
+single-file scope still burned most of its run ceiling, because the container
+had no way to run the TypeScript test suite it was asked to verify against,
+and instead of reporting that, it improvised a workaround (copied the file
+out of its read-only checkout, patched it with a hand-written script).
+
+### Added
+
+- Node 22 in the image, and dependencies (`npm ci` against the repo's own
+  `package-lock.json`) vendored once per task workspace, before the agent
+  ever starts — the same controlled, outside-the-agent's-own-execution step
+  that already injects the git credential. `node_modules` is deliberately
+  excluded from the read-only lockdown the rest of a cloned repo gets, so an
+  existing test command has somewhere to write its own cache or temp output.
+- Real network enforcement for every agent subprocess, not the "you have no
+  network access" sentence in a system prompt this project shipped with
+  until now. Every Claude Agent SDK invocation runs as a second, dedicated
+  user (`agent`, uid 1001) with an iptables rule restricting its egress to
+  the Anthropic API and nothing else — REJECT, not DROP, so a blocked
+  attempt reads as deliberate rather than a transient failure worth
+  retrying. `scripts/verify_agent_egress.sh` proves this from the
+  restricted UID's own perspective rather than asking anyone to trust that
+  the rule is present in the table.
+- `TaskState.BLOCKED`, a first-class outcome distinct from `failed` or
+  `abandoned`: the agent reporting that this environment cannot execute a
+  task at all (missing runtime, no way to verify a change) rather than that
+  it tried and failed. Never subject to `limits.max_attempts` or
+  `budget.max_usd_per_task` — retrying an environment gap at the same scope
+  cannot help, only fixing the gap (or deciding not to) changes the answer —
+  and never suppresses a future proposal for the same work, since the gap
+  that caused it may since be fixed. Every worker agent's system prompt now
+  states this as the expected response to a wall it cannot get past.
+
 ## [0.4.4] - 2026-09-29
 
 ### Fixed

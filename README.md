@@ -367,12 +367,19 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
 
 7. **Trigger the first tick yourself, on your own schedule, not the container's:**
    ```
-   docker compose exec scheduler python -m polska.cli tick
+   docker compose exec --user polska scheduler python -m polska.cli tick
    ```
    Omit the company slug to tick every active company, or pass one
    (`python -m polska.cli tick carscratch`) to run just it. This is the exact same
    `run_company_tick` call the scheduler makes on its own interval, run once, now,
    and it prints the same summary line `scripts/observe_ticks.py` does.
+
+   `--user polska` matters here specifically because `exec` (unlike `run`) attaches
+   to the already-running container directly rather than going through its
+   entrypoint, so it defaults to root. The container's own main process never runs
+   as root beyond the one entrypoint step that sets up the agent's network
+   restriction (see "Running as non-root" below); this flag is what keeps an
+   ad-hoc `exec` command the same way.
 
 ### Upgrading a deployment that predates the non-root container user
 
@@ -387,6 +394,45 @@ docker compose build
 docker compose up -d
 ```
 Nothing under `companies/` or `config/` needs this: the app only reads them.
+
+### The agent's network restriction, and how to verify it before trusting it
+
+"The agent has no network access" is enforced, not just stated in its system
+prompt. Every Claude Agent SDK subprocess runs as a second, dedicated user
+(`agent`, uid 1001, separate from `polska`, uid 1000, which runs the scheduler
+and dashboard themselves) with an iptables rule dropping its egress to
+everything except the Anthropic API. This exists so an engineer task reaching
+for `npm install` (now that Node is in the image, see below) or anything else
+that touches the network fails immediately and by design, not as a route to
+the outside world.
+
+Don't take that on trust. Before relying on it for anything real:
+```
+docker compose exec --user agent scheduler sh scripts/verify_agent_egress.sh
+```
+This proves, from the restricted UID's own perspective: an arbitrary host is
+refused immediately (not timed out), the Anthropic API is still reachable,
+and a DNS lookup for anything not already known is refused too. `--user agent`
+matters — running this as any other user proves nothing about what the agent
+itself can reach.
+
+If the scheduler container doesn't have the `NET_ADMIN` and `NET_RAW`
+capabilities `docker-compose.yml` grants it, or the kernel it runs on doesn't
+support the `iptables` `owner` match, the container refuses to start rather
+than run the agent unrestricted while believing otherwise — check
+`docker compose logs scheduler` for why.
+
+### Node, and what the engineer/analyst agents can actually run
+
+If a task's company repository has a `package-lock.json`, its dependencies
+are installed with `npm ci` once, when the workspace is cloned — before the
+agent ever starts, in the same controlled step that injects the git
+credential. This is deliberate: it's the one legitimate place a real network
+call to fetch something happens, and it happens outside the agent's own
+execution, under the unrestricted `polska` user, never inside it. The agent
+gets a working `node`/`npm`/`npx` and an already-populated `node_modules` to
+run an existing test command against; it cannot install anything itself, by
+the network restriction above, not by convention.
 
 ### What each container actually restarts on
 

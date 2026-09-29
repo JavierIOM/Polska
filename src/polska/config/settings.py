@@ -82,6 +82,17 @@ class Settings(BaseSettings):
     #: reason.
     dashboard_cookie_secure: bool = False
 
+    #: Path to a wrapper the Claude Agent SDK should exec instead of the real
+    #: CLI binary, one that drops privileges to a second, network-restricted
+    #: user before running a line of agent-controlled code (see the
+    #: Dockerfile and docker/entrypoint.sh). Unset by default: this only
+    #: exists inside the container, where the second user, setpriv's file
+    #: capability, and the iptables rule it enforces are all actually
+    #: present. Left unset in dev (Windows has none of those concepts), the
+    #: SDK falls back to its own normal CLI discovery, unrestricted, same as
+    #: before this existed.
+    agent_cli_wrapper_path: Path | None = None
+
     log_level: str = "INFO"
     sql_echo: bool = False
 
@@ -110,6 +121,31 @@ class Settings(BaseSettings):
                 "in, or export it in the environment."
             )
         return key
+
+    def resolved_agent_cli_wrapper_path(self) -> str | None:
+        """The wrapper path, verified to actually exist, or ``None`` if none
+        is configured.
+
+        Deliberately not "verify if set, else fall back silently to
+        unrestricted": an explicitly configured path that turns out missing
+        (a broken image build, an entrypoint step that silently failed to
+        run) must stop the process, the same reasoning schema_check.py
+        applies to a stale database. A path that was never configured at all
+        is a different, legitimate case, dev on a machine with no such
+        concept, and falls through to ``None`` so the SDK's own CLI
+        discovery is used unrestricted, same as before this existed.
+        """
+        if self.agent_cli_wrapper_path is None:
+            return None
+        if not self.agent_cli_wrapper_path.is_file():
+            raise RuntimeError(
+                f"POLSKA_AGENT_CLI_WRAPPER_PATH is set to {self.agent_cli_wrapper_path}, "
+                "but that file does not exist. This is meant to force every agent "
+                "subprocess through a privilege drop before it can run; refusing "
+                "to start rather than run every agent unrestricted while believing "
+                "otherwise."
+            )
+        return str(self.agent_cli_wrapper_path)
 
     def require_dashboard_secrets(self) -> tuple[str, str]:
         """The admin hash and session secret, or a clear failure."""

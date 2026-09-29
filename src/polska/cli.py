@@ -86,7 +86,12 @@ async def _tick(slug: str | None) -> None:
 
     registry = AdapterRegistry()
     guard = BudgetGuard(app_config)
-    runner = AgentRunner(app_config=app_config, budget_guard=guard, adapter_registry=registry)
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=guard,
+        adapter_registry=registry,
+        agent_cli_path=settings.resolved_agent_cli_wrapper_path(),
+    )
 
     paths = list(discover_profiles(settings.companies_dir))
     if slug:

@@ -19,6 +19,18 @@ services:
     build: .
     command: ["python", "-m", "polska.main"]
     env_file: .env
+    environment:
+      # Tells docker/entrypoint.sh to set up the agent-egress iptables rule.
+      # NET_ADMIN below is what actually lets it. The dashboard gets neither:
+      # it never spawns an agent subprocess, so it has nothing to restrict.
+      POLSKA_ENFORCE_AGENT_EGRESS: "1"
+      # Forces every agent subprocess through the privilege-drop wrapper the
+      # Dockerfile bakes in (see Settings.resolved_agent_cli_wrapper_path).
+      # Not set on the dashboard: it never spawns an agent subprocess either.
+      POLSKA_AGENT_CLI_WRAPPER_PATH: /usr/local/bin/polska-agent-cli
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     volumes:
       - ./data:/app/data
       - ./companies:/app/companies
@@ -29,7 +41,7 @@ services:
     # scheduler.run_on_start defaults to false. A container that has been
     # rebuilt or restarted still waits out the normal interval; trigger a
     # tick immediately with:
-    #   docker compose exec scheduler python -m polska.cli tick
+    #   docker compose exec --user polska scheduler python -m polska.cli tick
     restart: unless-stopped
 
   dashboard:

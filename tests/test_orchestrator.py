@@ -141,6 +141,28 @@ def test_planner_prompt_never_echoes_a_run_s_raw_error_text(
     assert "blocked before it started" in prompt
 
 
+def test_planner_prompt_shows_a_blocked_task_as_environment_not_failure(
+    session: Session, app_config: AppConfig, company: Company, task: Task
+) -> None:
+    """A task blocked by a missing runtime must never look like ordinary flaky
+    work: the planner should stop proposing it, not schedule a retry for it."""
+    task.transition_to(TaskState.RUNNING)
+    task.transition_to(
+        TaskState.BLOCKED,
+        result={"blocked_reason": "no Node/npm runtime available to run the test suite"},
+    )
+    session.commit()
+
+    runner = AgentRunner(
+        app_config=app_config, budget_guard=BudgetGuard(app_config), adapter_registry=None
+    )
+    prompt = _build_planner_prompt(session, company.id, [], runner)
+
+    assert "[blocked]" in prompt
+    assert "not executable in this environment" in prompt
+    assert "no Node/npm runtime available" in prompt
+
+
 def test_planner_prompt_states_todays_actual_remaining_budget(
     session: Session, app_config: AppConfig, company: Company
 ) -> None:

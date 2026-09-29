@@ -12,7 +12,8 @@ from polska.db.enums import TaskState
 #: Allowed transitions, keyed by the state being left.
 #:
 #: queued            -> picked up by a worker, or dropped before it ever ran
-#: running           -> finished, failed, or stopped at the approval gate
+#: running           -> finished, failed, stopped at the approval gate, or found
+#:                      to be unexecutable in this environment
 #: awaiting_approval -> resumes (approved), abandoned (rejected), or the run died waiting
 #: failed            -> requeued for a bounded retry, or given up on
 TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
@@ -23,6 +24,7 @@ TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
             TaskState.DONE,
             TaskState.FAILED,
             TaskState.ABANDONED,
+            TaskState.BLOCKED,
         }
     ),
     TaskState.AWAITING_APPROVAL: frozenset(
@@ -36,6 +38,7 @@ TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.FAILED: frozenset({TaskState.QUEUED, TaskState.ABANDONED}),
     TaskState.DONE: frozenset(),
     TaskState.ABANDONED: frozenset(),
+    TaskState.BLOCKED: frozenset(),
 }
 
 #: States a task can never leave. Reaching one of these is the end of its life.
@@ -70,12 +73,15 @@ DEDUP_SUPPRESSING_STATES: frozenset[TaskState] = OPEN_STATES | {TaskState.FAILED
 #: burying it in a magic exception.
 DEDUP_LOOKBACK_STATES: frozenset[TaskState] = frozenset({TaskState.DONE})
 
-#: ABANDONED must never suppress a proposal, at any age. It is the one state that
-#: means the system tried and gave up, and it is a bug, not a feature, for that to
-#: quietly stop the same genuine need from ever being proposed again. It is named
-#: here, rather than left as "whatever is not in the two sets above", so the
-#: exclusion is a decision on the page, not an accident of set arithmetic.
-DEDUP_NEVER_SUPPRESSES: frozenset[TaskState] = frozenset({TaskState.ABANDONED})
+#: ABANDONED and BLOCKED must never suppress a proposal, at any age. ABANDONED means
+#: the system tried and gave up; BLOCKED means the environment couldn't run it at
+#: all. Neither is a "this need doesn't exist" signal, and it is a bug, not a
+#: feature, for either to quietly stop the same genuine need from ever being
+#: proposed again -- a BLOCKED task in particular may become executable the moment
+#: the environment gap it hit is fixed. Named here, rather than left as "whatever
+#: is not in the two sets above", so the exclusion is a decision on the page, not
+#: an accident of set arithmetic.
+DEDUP_NEVER_SUPPRESSES: frozenset[TaskState] = frozenset({TaskState.ABANDONED, TaskState.BLOCKED})
 
 
 class IllegalTransition(Exception):
