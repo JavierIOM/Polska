@@ -334,19 +334,36 @@ def test_read_only_lockdown_never_descends_into_node_modules(tmp_path) -> None:
 # ------------------------------------------------------------------------ vendoring
 
 
-def test_vendoring_is_skipped_without_a_lockfile(tmp_path, monkeypatch) -> None:
-    from polska.workspace import _vendor_node_dependencies
+def test_vendoring_is_skipped_for_a_non_node_repo(tmp_path, monkeypatch) -> None:
+    from polska.workspace import _ensure_node_dependencies_vendored
 
     def _fail_if_called(*args, **kwargs):
-        raise AssertionError("npm ci must never run against a non-Node repo")
+        raise AssertionError("npm must never run against a non-Node repo")
 
     monkeypatch.setattr(subprocess, "run", _fail_if_called)
-    _vendor_node_dependencies(tmp_path, task_id=1)  # no package-lock.json here
+    _ensure_node_dependencies_vendored(tmp_path, task_id=1)  # no package.json here
+
+
+def test_vendoring_is_skipped_once_node_modules_already_exists(tmp_path, monkeypatch) -> None:
+    """The real gate: is node_modules there, not whether this looks like the
+    first time. Already-vendored means nothing left to do, on a fresh clone
+    or a retroactive one."""
+    from polska.workspace import _ensure_node_dependencies_vendored
+
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("npm must never run once node_modules exists")
+
+    monkeypatch.setattr(subprocess, "run", _fail_if_called)
+    _ensure_node_dependencies_vendored(tmp_path, task_id=1)
 
 
 def test_vendoring_runs_npm_ci_against_the_lockfile(tmp_path, monkeypatch) -> None:
-    from polska.workspace import _vendor_node_dependencies
+    from polska.workspace import _ensure_node_dependencies_vendored
 
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
     calls: list[tuple[list[str], Path]] = []
 
@@ -355,7 +372,7 @@ def test_vendoring_runs_npm_ci_against_the_lockfile(tmp_path, monkeypatch) -> No
         return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    _vendor_node_dependencies(tmp_path, task_id=1)
+    _ensure_node_dependencies_vendored(tmp_path, task_id=1)
 
     assert len(calls) == 1
     args, cwd = calls[0]
@@ -364,38 +381,156 @@ def test_vendoring_runs_npm_ci_against_the_lockfile(tmp_path, monkeypatch) -> No
 
 
 def test_a_failed_npm_ci_raises_workspace_error(tmp_path, monkeypatch) -> None:
-    from polska.workspace import _vendor_node_dependencies
+    from polska.workspace import _ensure_node_dependencies_vendored
 
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
 
     def _fake_run(args, **kwargs):
         raise subprocess.CalledProcessError(1, args, output=b"", stderr=b"lockfile drifted")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    with pytest.raises(WorkspaceError, match="npm ci failed"):
-        _vendor_node_dependencies(tmp_path, task_id=1)
+    with pytest.raises(WorkspaceError, match="ci failed"):
+        _ensure_node_dependencies_vendored(tmp_path, task_id=1)
 
 
 def test_vendored_node_modules_is_left_writable(tmp_path, monkeypatch) -> None:
     """node_modules must survive vendoring writable: a test runner may need to
     put its own cache or temp output somewhere inside it, and the read-only
     lockdown that protects the company's own source must never apply here."""
-    from polska.workspace import _vendor_node_dependencies
+    from polska.workspace import _ensure_node_dependencies_vendored
 
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
     node_modules = tmp_path / "node_modules"
-    (node_modules / "some-package").mkdir(parents=True)
-    installed_file = node_modules / "some-package" / "index.js"
-    installed_file.write_text("module.exports = {};\n", encoding="utf-8")
-    installed_file.chmod(0o444)  # as if npm had installed it read-only
 
+    def _fake_run(args, **kwargs):
+        # Simulates what a real npm ci would have created.
+        (node_modules / "some-package").mkdir(parents=True)
+        installed_file = node_modules / "some-package" / "index.js"
+        installed_file.write_text("module.exports = {};\n", encoding="utf-8")
+        installed_file.chmod(0o444)  # as if npm had installed it read-only
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    _ensure_node_dependencies_vendored(tmp_path, task_id=1)
+
+    installed_file = node_modules / "some-package" / "index.js"
+    assert installed_file.stat().st_mode & 0o777 == 0o666
+    assert node_modules.stat().st_mode & 0o777 == 0o777
+
+
+# ------------------------------------------------------------- retroactive vendoring
+
+
+def test_a_clone_missing_only_the_lockfile_falls_back_to_npm_install(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """The exact incident this closes: an old clone whose lockfile
+    _strip_low_value_files already removed, from before vendoring existed to
+    need it kept. No lockfile means no npm ci, and re-fetching just that one
+    file would mean a second use of the clone credential -- so this resolves
+    fresh from package.json instead."""
+    from polska.workspace import _ensure_node_dependencies_vendored
+
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    # Deliberately no package-lock.json: already stripped, same as a real
+    # pre-vendoring clone.
+    calls: list[list[str]] = []
+
+    def _fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    with caplog.at_level("WARNING", logger="polska.workspace"):
+        _ensure_node_dependencies_vendored(tmp_path, task_id=9)
+
+    assert calls == [["npm", "install", "--no-audit", "--no-fund"]]
+    assert any("predates dependency vendoring" in r.getMessage() for r in caplog.records)
+
+
+def test_retroactive_vendoring_temporarily_unlocks_and_relocks_a_read_only_clone(
+    tmp_path, monkeypatch
+) -> None:
+    """An old clone this runs against retroactively may already have been
+    locked read-only by a previous _make_read_only pass, long before this
+    existed to check for it. npm needs to create node_modules inside it
+    regardless, and the directory must end up exactly as locked as it
+    started once done.
+
+    Drives this through the module's own os.access/Path.chmod calls rather
+    than real filesystem permissions: chmod's actual enforcement is, per
+    this project's own established caveat (see _make_read_only's docstring),
+    complete on Linux and only partial on Windows, so relying on the real OS
+    to hold a directory read-only would make this test meaningless on the
+    machine most likely to run it during development.
+    """
+    import polska.workspace as workspace_module
+    from polska.workspace import _ensure_node_dependencies_vendored
+
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workspace_module.os, "access", lambda *a, **kw: False)  # "locked"
+    chmod_calls: list[int] = []
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: chmod_calls.append(mode))
     monkeypatch.setattr(
         subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0)
     )
-    _vendor_node_dependencies(tmp_path, task_id=1)
 
-    assert installed_file.stat().st_mode & 0o777 == 0o666
-    assert node_modules.stat().st_mode & 0o777 == 0o777
+    _ensure_node_dependencies_vendored(tmp_path, task_id=9)
+
+    # Unlocked (0o755) before the install, relocked (0o555) after -- in that
+    # order, and nothing left mid-way if the install itself had failed
+    # (see the next test for that half).
+    assert chmod_calls == [0o755, 0o555]
+
+
+def test_a_locked_clone_stays_locked_if_the_install_itself_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """The relock has to happen even when npm fails, or a workspace that was
+    read-only before this ran ends up writable after a failed attempt --
+    exactly the kind of half-finished state this project refuses to leave
+    behind elsewhere (see WorkspaceError's own callers)."""
+    import polska.workspace as workspace_module
+    from polska.workspace import WorkspaceError, _ensure_node_dependencies_vendored
+
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workspace_module.os, "access", lambda *a, **kw: False)
+    chmod_calls: list[int] = []
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: chmod_calls.append(mode))
+
+    def _fake_run(args, **kwargs):
+        raise subprocess.CalledProcessError(1, args, output=b"", stderr=b"network unreachable")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    with pytest.raises(WorkspaceError):
+        _ensure_node_dependencies_vendored(tmp_path, task_id=9)
+
+    assert chmod_calls == [0o755, 0o555]  # relocked even though the install raised
+
+
+def test_a_freshly_writable_clone_is_never_chmodded_by_vendoring(
+    tmp_path, monkeypatch
+) -> None:
+    """The non-retroactive case (a brand new clone, already writable) must
+    take no lock/unlock action at all: _make_read_only runs right after this
+    and is what applies the real lockdown, exactly once, the same as always."""
+    import polska.workspace as workspace_module
+    from polska.workspace import _ensure_node_dependencies_vendored
+
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workspace_module.os, "access", lambda *a, **kw: True)  # "writable"
+    chmod_calls: list[int] = []
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: chmod_calls.append(mode))
+    monkeypatch.setattr(
+        subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0)
+    )
+
+    _ensure_node_dependencies_vendored(tmp_path, task_id=1)
+
+    assert chmod_calls == []
 
 
 def _make_workspace_from_local(tmp_path, profile, local_repo, monkeypatch, *, task_id: int) -> Path:

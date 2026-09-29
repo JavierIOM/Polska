@@ -51,7 +51,9 @@ logger = logging.getLogger("polska.workspace")
 REPO_DIRNAME = "repo"
 
 _CLONE_TIMEOUT_SECONDS = 120
-_NPM_CI_TIMEOUT_SECONDS = 300
+#: Covers both npm ci and its npm install fallback; installing a project's
+#: full dependency tree is the slow part either way.
+_NPM_INSTALL_TIMEOUT_SECONDS = 300
 
 #: Dependency lockfiles: never useful to an agent doing product work, often huge
 #: (CarScratch's own package-lock.json is 478KB, ~120k tokens on its own), and
@@ -126,7 +128,22 @@ def prepare_task_workspace(
 
     repo_dir = task_workspace / REPO_DIRNAME
     if repo_dir.exists():
+        # Correct not to re-clone (a retry should see exactly what the first
+        # attempt saw, and re-cloning would be a second, unnecessary use of
+        # the credential) -- but that used to be the *only* thing checked
+        # here, which silently meant "and therefore skip everything else
+        # workspace prep does too", including dependency vendoring added
+        # long after some of these clones were made. A task whose workspace
+        # already existed before that feature shipped got its lockfile
+        # stripped, same as always, and then got the same missing-toolchain
+        # experience forever, on every retry, indistinguishable from Node
+        # never having been installed at all. Checking "does this clone
+        # exist" was answering "did we do this before"; what actually needs
+        # answering is "is what this task needs present now", which is what
+        # _ensure_node_dependencies_vendored checks directly instead of
+        # inferring.
         logger.info("Workspace for task %d already has a clone; leaving it as is.", task_id)
+        _ensure_node_dependencies_vendored(repo_dir, task_id)
         return task_workspace
 
     branch = github.options.get("working_branch") or github.options.get("default_branch") or "main"
@@ -203,53 +220,97 @@ def _clone_read_only(
                 "its .git directory still exists."
             )
 
-    _vendor_node_dependencies(repo_dir, task_id)
+    _ensure_node_dependencies_vendored(repo_dir, task_id)
     _strip_low_value_files(repo_dir)
     _make_read_only(repo_dir)
 
 
-def _vendor_node_dependencies(repo_dir: Path, task_id: int) -> None:
-    """Install exactly what ``package-lock.json`` specifies, once, before the
-    workspace is ever handed to an agent.
+def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
+    """Install what a Node project's dependencies actually require to be
+    present right now, checked directly rather than inferred from whether
+    this looks like the first time a workspace has been prepared.
 
-    Runs here, in Polska's own process, before the clone is stripped and
-    locked read-only -- the same "controlled step outside the agent's own
-    execution" the credential injection above already relies on. This is the
-    one legitimate place a real network call to fetch a dependency happens;
-    the agent's own subprocess, run under a separate, network-restricted
-    user, never reaches the registry itself.
+    Keyed on whether ``node_modules`` exists, nothing else: a clone made
+    before this feature existed used to never get this call at all (see
+    ``prepare_task_workspace``'s own early return for an existing clone),
+    which meant "was a workspace already prepared" was silently standing in
+    for "does this workspace have what it needs", and a workspace could
+    satisfy the first without ever satisfying the second. Checking the real
+    condition means this runs, and self-heals, for an old clone exactly the
+    same way it does for a brand new one.
 
-    ``npm ci`` (not ``npm install``): deterministic against the committed
-    lockfile, and it refuses outright if the lockfile and package.json have
-    drifted, rather than silently resolving something slightly different from
-    what the repository's own CI would install.
+    Runs here, in Polska's own process, before the agent ever starts, on
+    either a brand new clone or a years-old one -- the same "controlled step
+    outside the agent's own execution" the credential injection above already
+    relies on. This is the one legitimate place a real network call to fetch
+    a dependency happens; the agent's own subprocess, run under a separate,
+    network-restricted user, never reaches the registry itself.
 
-    Skipped entirely when there is no ``package-lock.json``: not every
-    company's repository is a Node project, and running ``npm ci`` against
-    one that isn't is an error, not a no-op.
+    Skipped entirely when there is no ``package.json``: not every company's
+    repository is a Node project, and running an npm command against one that
+    isn't is an error, not a no-op.
     """
-    lockfile = repo_dir / "package-lock.json"
-    if not lockfile.exists():
+    node_modules = repo_dir / "node_modules"
+    if node_modules.exists():
         return
+
+    if not (repo_dir / "package.json").exists():
+        return
+
+    lockfile = repo_dir / "package-lock.json"
+    if lockfile.exists():
+        # The common case, a clone made after this existed: deterministic
+        # against exactly what's committed, and refuses outright if the
+        # lockfile and package.json have drifted, rather than silently
+        # resolving something slightly different from what the repository's
+        # own CI would install.
+        command = ["npm", "ci", "--no-audit", "--no-fund"]
+    else:
+        # An old clone: _strip_low_value_files already removed its lockfile,
+        # from long before this function existed to need it kept. Re-fetching
+        # just that one file would mean using the git credential a second
+        # time for a workspace already paid for once, which is exactly the
+        # cost prepare_task_workspace's own idempotency check exists to
+        # avoid. npm install resolves fresh from package.json instead, no
+        # lockfile and no credential needed, at the honest cost of not being
+        # pinned to the exact tree the original commit would have installed.
+        logger.warning(
+            "Task %d's clone predates dependency vendoring and its lockfile "
+            "is already gone; resolving fresh with npm install instead of "
+            "npm ci, since re-fetching the lockfile would mean a second use "
+            "of the clone credential.",
+            task_id,
+        )
+        command = ["npm", "install", "--no-audit", "--no-fund"]
+
+    # repo_dir may already be locked read-only: an old clone _make_read_only
+    # already ran against, in a process that predated this function knowing
+    # to look for it. npm needs to create node_modules inside it either way.
+    was_locked = not os.access(repo_dir, os.W_OK)
+    if was_locked:
+        repo_dir.chmod(0o755)
 
     try:
         subprocess.run(
-            ["npm", "ci", "--no-audit", "--no-fund"],
+            command,
             cwd=repo_dir,
             check=True,
             capture_output=True,
-            timeout=_NPM_CI_TIMEOUT_SECONDS,
+            timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
         )
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode(errors="replace") if exc.stderr else ""
         raise WorkspaceError(
-            f"npm ci failed for task {task_id}'s workspace: {stderr[:500]}"
+            f"{command[1]} failed for task {task_id}'s workspace: {stderr[:500]}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise WorkspaceError(
-            f"npm ci for task {task_id}'s workspace did not finish within "
-            f"{_NPM_CI_TIMEOUT_SECONDS}s."
+            f"{command[1]} for task {task_id}'s workspace did not finish within "
+            f"{_NPM_INSTALL_TIMEOUT_SECONDS}s."
         ) from exc
+    finally:
+        if was_locked:
+            repo_dir.chmod(0o555)
 
     # node_modules is vendored, not source: nothing under it needs the same
     # write protection as the repository the engineer must not edit, and a
@@ -259,7 +320,6 @@ def _vendor_node_dependencies(repo_dir: Path, task_id: int) -> None:
     # a line of the company's own code, and the agent subprocess runs as a
     # different UID (see runner.py) with no group relationship to this one
     # worth setting up just to avoid it.
-    node_modules = repo_dir / "node_modules"
     if node_modules.exists():
         node_modules.chmod(0o777)
         for root, dirs, files in os.walk(node_modules):
@@ -275,8 +335,9 @@ def _strip_low_value_files(repo_dir: Path) -> None:
     Called before ``_make_read_only``, since these are real deletions and need
     write access to do. Skips ``node_modules`` entirely: vendored dependencies
     are not the low-value noise this exists to trim (see
-    ``_vendor_node_dependencies``), and a binary asset a package genuinely
-    needs at runtime, an icon, a compiled native addon, must survive here.
+    ``_ensure_node_dependencies_vendored``), and a binary asset a package
+    genuinely needs at runtime, an icon, a compiled native addon, must
+    survive here.
     """
     removed_bytes = 0
     for path in list(repo_dir.rglob("*")):
@@ -339,10 +400,11 @@ def _make_read_only(path: Path) -> None:
     """Best-effort write-protection for the whole tree. See the module docstring:
     this is complete on the Linux deployment target and partial on Windows.
 
-    Never descends into ``node_modules``: see ``_vendor_node_dependencies``,
-    which deliberately leaves it writable so a test runner has somewhere to
-    put its own cache or temp output, and skips its chmod here entirely
-    rather than lock it down and immediately contradict that.
+    Never descends into ``node_modules``: see
+    ``_ensure_node_dependencies_vendored``, which deliberately leaves it
+    writable so a test runner has somewhere to put its own cache or temp
+    output, and skips its chmod here entirely rather than lock it down and
+    immediately contradict that.
     """
     for root, dirs, files in os.walk(path):
         if "node_modules" in dirs:

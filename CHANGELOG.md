@@ -5,6 +5,27 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-09-29
+
+The v0.5.0 toolchain fix didn't fix tasks 9 and 10: two more engineer runs,
+interrupted at their ceiling, that never got as far as running a test.
+
+### Fixed
+
+- `prepare_task_workspace` only checked whether a clone existed, and skipped
+  dependency vendoring entirely if it did. Correct for its original purpose
+  (never re-clone on a retry, a second unnecessary use of the credential),
+  but it meant any task whose workspace was cloned before vendoring shipped
+  never got it, on any future retry, forever, indistinguishable from Node
+  never being installed at all. `_ensure_node_dependencies_vendored`
+  (renamed from `_vendor_node_dependencies`) now checks the thing that
+  actually matters, whether `node_modules` is present, on every workspace
+  prep call, fresh or years old, and self-heals the old ones. When the
+  lockfile has already been stripped from an old clone, it resolves with
+  `npm install` instead of `npm ci` rather than re-fetching just that file,
+  which would mean a second use of the clone credential — the exact cost
+  the idempotency check was protecting against in the first place.
+
 ## [0.5.1] - 2026-09-29
 
 The v0.5.0 build failed on the first real attempt: `setcap` isn't in
