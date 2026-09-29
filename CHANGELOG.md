@@ -5,6 +5,25 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-09-29
+
+### Added
+
+- The database moved onto its own bind mount, `db/`, `chmod 700`, separate
+  from `data/`. It used to share `data/` with task workspaces, which the
+  agent subprocess needs to traverse into for its own task — and, found
+  live, used to read the database directly through that same mount. Cheaper
+  than a filesystem overhaul: an unprivileged UID has no path at all into a
+  mount it's simply not on, no `CAP_SYS_ADMIN` needed. `Settings.database_url`
+  now defaults to `db/polska.db`; see README's "Moving the database onto its
+  own mount" for migrating an existing deployment across without losing
+  the WAL sidecar files.
+- README's "The agent's filesystem access" section: what's confirmed closed
+  (the database), what's deliberately still open (cross-task workspace
+  access, since the real fix needs `CAP_SYS_ADMIN` and the actual exposure
+  is bounded while `force_dry_run` holds), and the trigger to revisit that
+  decision — the first real adapter going live, not a fixed date.
+
 ## [0.5.3] - 2026-09-29
 
 ### Fixed

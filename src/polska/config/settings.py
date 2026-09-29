@@ -36,12 +36,22 @@ class Settings(BaseSettings):
     real invocation contexts this project has: ``python -m polska.main`` (or
     ``.dashboard.server``, or ``.cli``) run from the repo root in dev, and the
     same commands run with ``WORKDIR /app`` in the container, where
-    ``docker-compose.yml`` bind-mounts ``config/``, ``companies/`` and
-    ``data/`` at exactly that path. Every env var below can still override
+    ``docker-compose.yml`` bind-mounts ``config/``, ``companies/``, ``data/``
+    and ``db/`` at exactly that path. Every env var below can still override
     these explicitly (see ``.env.example``) and ``docker-compose.yml``'s
     services still set them for clarity, but correctness no longer depends on
     that: the same relative default resolves right either way, with or
     without ``.env`` populated.
+
+    ``database_url`` defaults under ``db/``, not ``data/``: they are two
+    separate bind mounts (see ``docker-compose.yml``), on purpose. ``data/``
+    holds task workspaces, which the agent subprocess (a second, unprivileged
+    UID, see ``runner.py``'s ``cli_path``) needs to traverse into for its own
+    task. ``db/`` holds the budget ledger and the approval queue, and that
+    UID has no path into it at all -- found live: an engineer task that had
+    run out of other ideas read the database directly, and while nothing it
+    found there was a credential or a write, the fix is to remove the path,
+    not to trust that every future task stays equally uninterested.
     """
 
     model_config = SettingsConfigDict(
@@ -56,7 +66,7 @@ class Settings(BaseSettings):
         default=SecretStr(""), validation_alias="ANTHROPIC_API_KEY"
     )
 
-    database_url: str = "sqlite+pysqlite:///data/polska.db"
+    database_url: str = "sqlite+pysqlite:///db/polska.db"
     config_path: Path = Path("config/default.yaml")
     companies_dir: Path = Path("companies")
     workspace_root: Path = Path("data/workspaces")

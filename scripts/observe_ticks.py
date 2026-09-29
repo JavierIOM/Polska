@@ -20,7 +20,7 @@ spend after each tick and stops before starting the next one if it has already b
 exceeded, so a session with a real dollar cap can't blow through it unattended
 between ticks.
 
-Runs against the real database named in settings (``data/polska.db`` by default),
+Runs against the real database named in settings (``db/polska.db`` by default),
 not a throwaway one: a tick's history matters to the next tick's dedup, so this is
 meant to accumulate state across runs the same way the real scheduler would.
 """

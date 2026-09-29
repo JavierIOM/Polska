@@ -1,6 +1,17 @@
 # Two containers, one image (see Dockerfile), sharing the SQLite database and
 # company profiles through bind mounts, nothing else.
 #
+# db/ and data/ are deliberately separate mounts, not one shared directory.
+# data/ holds task workspaces, which the agent subprocess (a second,
+# unprivileged UID inside the scheduler container, see runner.py's cli_path)
+# needs to traverse into for its own task. db/ holds the budget ledger and
+# the approval queue, and that UID has no path into it at all -- found live:
+# an engineer task that had run out of other ideas read the database
+# directly through the data/ mount it already had legitimate access to.
+# Nothing it found there was a credential or a write, but the fix is to
+# remove the path, not to trust every future task to stay equally
+# uninterested. See README's "The agent's filesystem access" section.
+#
 # Deliberately does NOT run migrations or seed auth on its own: this project's
 # own rule (see main.py) is that migrations are a separate, explicit step, not
 # something a container does to itself on boot. Before the first `up`:
@@ -32,6 +43,7 @@ services:
       - NET_ADMIN
       - NET_RAW
     volumes:
+      - ./db:/app/db
       - ./data:/app/data
       - ./companies:/app/companies
       - ./config:/app/config
@@ -49,6 +61,7 @@ services:
     command: ["python", "-m", "polska.dashboard.server"]
     env_file: .env
     volumes:
+      - ./db:/app/db
       - ./data:/app/data
       - ./companies:/app/companies
       - ./config:/app/config

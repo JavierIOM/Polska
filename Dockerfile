@@ -121,15 +121,22 @@ COPY alembic.ini ./
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# companies/, config/ and data/ are bind-mounted by docker-compose, not baked
-# in here: editing a company profile or a ceiling should never need a rebuild.
-# Their in-image ownership below is irrelevant once a bind mount replaces
-# them at `docker compose up` time -- the mount's write access is decided
-# entirely by the *host-side* directory's ownership, not anything set here.
-# This chown only matters for the parts of /app that stay baked into the
-# image (src/, migrations/, alembic.ini) and for running this image without
-# compose at all.
-RUN mkdir -p data companies config && chown -R polska:polska /app
+# companies/, config/, data/ and db/ are bind-mounted by docker-compose, not
+# baked in here: editing a company profile or a ceiling should never need a
+# rebuild. Their in-image ownership/mode below is irrelevant once a bind
+# mount replaces them at `docker compose up` time -- the mount's actual
+# access is decided entirely by the *host-side* directory's ownership and
+# mode, not anything set here (see README's deployment section for the
+# host-side chmod db/ needs). This chown only matters for the parts of /app
+# that stay baked into the image (src/, migrations/, alembic.ini) and for
+# running this image without compose at all.
+#
+# db/ additionally chmod'd 0700 even here: it is the one path the agent UID
+# (1001) must never be able to traverse into at all, and this is a cheap,
+# harmless second layer under the host-side mount doing the real work.
+RUN mkdir -p data companies config db \
+    && chown -R polska:polska /app \
+    && chmod 0700 db
 
 # Fails the build immediately, by name, if anything the agent's network
 # restriction depends on didn't actually make it into this image -- the

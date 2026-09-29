@@ -12,8 +12,11 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# Runtime data: the database, its WAL sidecars, and agent workspaces
+# Runtime data: agent workspaces
 data/
+# The database and its WAL sidecars, on their own bind mount the agent UID
+# has no path into at all (see README's "The agent's filesystem access" section)
+db/
 
 # Dependencies
 node_modules/

@@ -308,18 +308,29 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
 2. **Clone the repo and prepare local state:**
    ```
    git clone <this repo's URL> polska && cd polska
-   mkdir -p data
-   sudo chown -R 1000:1000 data
+   mkdir -p data db
+   sudo chown -R 1000:1000 data db
+   sudo chmod 700 db
    cp .env.example .env
    ```
    The container runs as a non-root user, fixed at UID/GID 1000 in the
    `Dockerfile` (the Claude Code CLI refuses `--dangerously-skip-permissions`,
    what `permission_mode="bypassPermissions"` becomes at the CLI level, for
-   root — see `runner.py`). `data/` is bind-mounted, so *its* write access is
-   decided entirely by this host-side ownership, not anything set inside the
-   image; skip the `chown` and the scheduler's very first write to
-   `data/polska.db` fails with a permission error instead of a missing-file
-   one. `companies/` and `config/` don't need it: the app only ever reads
+   root — see `runner.py`). `data/` and `db/` are bind-mounted, so *their*
+   write access is decided entirely by this host-side ownership, not anything
+   set inside the image; skip the `chown` and the scheduler's very first write
+   to the database fails with a permission error instead of a missing-file
+   one.
+
+   `db/` is deliberately its own mount, separate from `data/`, and `chmod 700`
+   on top of the ownership: it holds the budget ledger and the approval queue,
+   and the agent subprocess (a second, unprivileged UID, see "The agent's
+   filesystem access" below) must have no path into it at all, not merely be
+   denied by a permission it could still see. `data/` holds task workspaces,
+   which that same UID does need to traverse into for its own task, so it
+   stays at the ownership-only, more permissive default.
+
+   `companies/` and `config/` don't need any of this: the app only ever reads
    them, and a plain `git clone` already leaves them world-readable.
 
 3. **Put a real `ANTHROPIC_API_KEY` in `.env`.** Leave `POLSKA_ADMIN_PASSWORD_HASH`
@@ -395,6 +406,58 @@ docker compose up -d
 ```
 Nothing under `companies/` or `config/` needs this: the app only reads them.
 
+### Moving the database onto its own mount
+
+The database used to live under `data/`, alongside task workspaces — which
+meant the agent subprocess, needing to traverse `data/` for its own task,
+also had a path to the database, and used it (see "The agent's filesystem
+access" below). Fixed by giving the database its own bind mount, `db/`, that
+the agent UID has no path into at all. Moving an existing database across:
+
+```
+docker compose down
+git pull
+mkdir -p db
+sudo mv data/polska.db data/polska.db-wal data/polska.db-shm db/ 2>/dev/null || true
+sudo chown -R 1000:1000 db
+sudo chmod 700 db
+docker compose build
+docker compose up -d
+```
+
+`docker compose down` first, always: SQLite's WAL mode (which this project
+runs in) keeps uncommitted state in `polska.db-wal` alongside the main file,
+and moving one without the other, or moving either while something still
+has it open, is exactly how you lose the tail of a database rather than all
+of it, the kind of failure that looks fine until the next read of a page the
+move corrupted. Both containers must be stopped and nothing else touches
+`db/`, `-wal`, or `-shm` while they're not.
+
+`|| true` on the move: the `-wal`/`-shm` sidecars only exist while something
+was actually connected recently (SQLite removes them on a clean close in
+some circumstances), so their absence isn't an error, only `polska.db`
+itself missing would be.
+
+Verify it landed rather than assuming it did:
+```
+ls -la db/
+docker compose run --rm scheduler python <<'PYEOF'
+from polska.config.settings import load_settings
+from polska.db.base import make_engine
+
+settings = load_settings()
+print("resolved to:", settings.database_url)
+engine = make_engine(settings.database_url)
+with engine.connect() as conn:
+    print("companies:", conn.exec_driver_sql("SELECT COUNT(*) FROM companies").scalar())
+PYEOF
+```
+A real count, not zero and not an error, confirms the moved file is what
+`Settings.database_url`'s new default actually opened. Skip `tick`, `--help`
+or otherwise, for this: argparse exits before the command body ever runs, so
+it would prove nothing about the database at all, and a real (non-`--help`)
+tick would dispatch actual work, not something to do just to check a path.
+
 ### The agent's network restriction, and how to verify it before trusting it
 
 "The agent has no network access" is enforced, not just stated in its system
@@ -433,6 +496,56 @@ scheduler` to tell them apart:
 - **The scheduler container's own capabilities or kernel are the problem**:
   missing the `NET_ADMIN`/`NET_RAW` capabilities `docker-compose.yml` grants
   it, or a kernel that doesn't support the `iptables` `owner` match.
+
+### The agent's filesystem access
+
+The agent subprocess runs as its own UID (`agent`, 1001, see the network
+section above), but a UID is not automatically a filesystem boundary: it
+only restricts what the *kernel's* ownership and mode bits actually deny,
+never what a prompt says. Checked directly rather than assumed, as of this
+project's own investigation:
+
+- **The database is no longer reachable.** It was, through `data/`, the same
+  mount the agent needs for its own task workspace — confirmed live, an
+  engineer task that had run out of other ideas read it directly. Moved to
+  its own `db/` mount, `chmod 700`, that UID has no path into at all (see
+  "Moving the database onto its own mount" above). Verified the same way the
+  network restriction is: `test -r`/`test -w` run *as* the agent UID, not
+  `stat` output reasoned about afterward.
+  ```
+  docker compose exec --user agent scheduler sh -c 'test -e /app/db && echo "reachable" || echo "no such path"'
+  ```
+  Expect `no such path`. If it prints `reachable`, the mount or its mode
+  didn't land as intended, before anything else, check that.
+- **Company profiles and Polska's own source are still world-readable.**
+  Deliberately left alone: nothing secret lives in either (a company profile
+  names an env var, never its value), and locking them down buys nothing.
+- **Cross-task workspace access is still open, on purpose, for now.**
+  `data/workspaces/<task id>/` is `chmod 0o777` (`workspace.py`) so the
+  agent's own task can write to it, but there is one `agent` UID shared
+  across every task, so that grant isn't scoped to "this task", it reaches
+  every task's workspace, including another company's. The real fix needs
+  either a UID per task or a mount namespace per task
+  (`CAP_SYS_ADMIN`, a much larger grant than the network work needed);
+  deferred deliberately, not overlooked, because the actual exposure is
+  bounded: no secret reaches the agent's environment (fixed separately, see
+  below), no network egress beyond the Anthropic API exists to send anything
+  found to, and the database move above closes the one path that could have
+  mattered most. What's left is one task's scratch work readable, and in
+  principle writable, by another task's agent — recoverable, not a secret or
+  a forged record.
+
+  **Revisit this the moment `force_dry_run` goes off for any adapter.** The
+  containment argument above rests entirely on an agent having nothing to
+  *do* with what it finds beyond writing it into its own output. Once a real
+  adapter can act on the world, that argument no longer holds, and this gap
+  needs a real answer, not a deferred one.
+- **The agent subprocess's own environment is minimal, separately from all
+  of the above.** It used to inherit the dashboard's login secrets, unrelated
+  to any file it could reach at all. Fixed in the `polska-agent-cli` wrapper
+  itself (`env -i`, three variables survive: the API key, `PATH`, `HOME`),
+  not by anything filesystem-shaped, since the two are genuinely different
+  channels and closing one says nothing about the other.
 
 ### Node, and what the engineer/analyst agents can actually run
 
