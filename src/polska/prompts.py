@@ -79,6 +79,17 @@ you have context for.
 
 Never invent a goal that was not given to you.
 
+If a piece of work only actually makes sense as several independent units (e.g.
+"detect the silent-failure mode of each of these six upstream sources"), do not
+describe it as one task. A worker given one task that bundles several unrelated
+units of work has no way to finish some of them and report on the rest: it either
+tries to do all of them in one run and exhausts its budget before any of them
+converges, or it picks one arbitrarily and the others silently never happen. Instead,
+write the whole thing as ONE proposal and list each independent unit in
+`sub_units`, each with its own title and description scoped to that unit alone.
+Leave `sub_units` empty for the normal case: most proposals are already one
+coherent unit and should stay that way, not be split for its own sake.
+
 Never cite a number that was not explicitly given to you in this prompt, especially a
 dollar figure. If you want to reason about remaining budget, use the one figure
 labelled as such below, or say you don't know it. A number that appears anywhere else

@@ -351,6 +351,59 @@ async def test_a_proposed_task_is_enqueued_against_its_goal(
         assert task.state == TaskState.QUEUED
 
 
+async def test_sub_units_become_independent_tasks(
+    session_factory, app_config: AppConfig, workspace_root
+) -> None:
+    """The disguised-multi-unit-task fix: one proposal naming sub_units
+    becomes one Task per unit, not one oversized task. summary.proposed
+    stays at the planner's own count (1); summary.enqueued reflects the
+    real number of tasks actually created (2)."""
+    plan = {
+        "tasks": [
+            {
+                "type": "research",
+                "title": "Map all six upstream sources",
+                "description": "Document every silent-failure path.",
+                "goal_key": "growth",
+                "rationale": "None audited yet.",
+                "priority": 10,
+                "sub_units": [
+                    {"title": "DVLA silent-failure signal", "description": "Just DVLA."},
+                    {"title": "MOT silent-failure signal", "description": "Just MOT."},
+                ],
+            }
+        ]
+    }
+    config = app_config.model_copy(
+        update={"limits": app_config.limits.model_copy(update={"max_concurrent_tasks": 0})}
+    )
+    runner = _ScriptedRunner(config, plan, [])
+
+    loaded = _profile()
+    summary = await run_company_tick(session_factory, config, runner, loaded, workspace_root)
+
+    assert summary.proposed == 1
+    assert summary.enqueued == 2
+    with session_factory() as session:
+        tasks = session.execute(select(Task)).scalars().all()
+        assert {task.title for task in tasks} == {
+            "DVLA silent-failure signal",
+            "MOT silent-failure signal",
+        }
+        goal = session.execute(select(Goal)).scalar_one()
+        assert all(task.goal_id == goal.id for task in tasks)
+        split_events = [
+            e
+            for e in session.execute(select(ActivityEvent)).scalars().all()
+            if e.kind == ActivityKind.TASK_SPLIT
+        ]
+        assert len(split_events) == 1
+        assert split_events[0].detail["units"] == [
+            "DVLA silent-failure signal",
+            "MOT silent-failure signal",
+        ]
+
+
 async def test_an_inactive_company_is_skipped_entirely(
     session_factory, app_config: AppConfig, workspace_root
 ) -> None:

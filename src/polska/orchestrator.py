@@ -34,7 +34,7 @@ from polska.db.state import ACTIVE_STATES
 from polska.db.types import utcday, utcnow
 from polska.dedup import deduplicate
 from polska.runner import AgentRunner
-from polska.schemas.planner import PlannerOutput
+from polska.schemas.planner import PlannerOutput, ProposedTask
 from polska.sync import sync_company
 from polska.workspace import WorkspaceError, prepare_task_workspace
 
@@ -366,6 +366,51 @@ async def run_company_tick(
     return summary
 
 
+def _flatten_sub_units(
+    session: Session, company_id: int, proposals: list[ProposedTask]
+) -> list[ProposedTask]:
+    """Expand each proposal's ``sub_units``, if any, into their own top-level
+    proposals, so dedup and enqueue treat every independent unit of work as
+    its own task rather than one oversized task that can only fail as a
+    whole (the disguised-multi-unit-task pattern: a single proposal covering
+    several unrelated sources, none of which converges before the run
+    ceiling, because there was never a task boundary between them).
+
+    A proposal with no ``sub_units`` passes through unchanged. One with
+    sub_units disappears entirely in favour of one synthetic
+    :class:`ProposedTask` per sub-unit -- the parent itself is never
+    enqueued once split, only its pieces are, each inheriting the parent's
+    ``type``/``goal_key``/``rationale``/``priority`` so they still sort and
+    dedup sensibly, but with their own title and description as the planner
+    wrote them.
+    """
+    flattened: list[ProposedTask] = []
+    for proposal in proposals:
+        if not proposal.sub_units:
+            flattened.append(proposal)
+            continue
+        children = [
+            ProposedTask(
+                type=proposal.type,
+                title=unit.title,
+                description=unit.description,
+                goal_key=proposal.goal_key,
+                rationale=proposal.rationale,
+                priority=proposal.priority,
+            )
+            for unit in proposal.sub_units
+        ]
+        flattened.extend(children)
+        log(
+            session,
+            company_id=company_id,
+            kind=ActivityKind.TASK_SPLIT,
+            summary=f"Split into {len(children)}: {proposal.title}",
+            detail={"units": [child.title for child in children]},
+        )
+    return flattened
+
+
 async def _enqueue_proposals(
     session: Session,
     app_config: AppConfig,
@@ -375,7 +420,8 @@ async def _enqueue_proposals(
     summary: TickSummary,
 ) -> None:
     summary.proposed = len(plan.tasks)
-    capped = sorted(plan.tasks, key=lambda t: t.priority)[: app_config.limits.max_tasks_per_tick]
+    flattened = _flatten_sub_units(session, company_id, plan.tasks)
+    capped = sorted(flattened, key=lambda t: t.priority)[: app_config.limits.max_tasks_per_tick]
 
     decisions = await deduplicate(
         session, runner, company_id=company_id, config=app_config.dedup, proposals=capped

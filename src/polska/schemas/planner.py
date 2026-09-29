@@ -12,6 +12,41 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from polska.db.enums import TaskType
 
+_PLACEHOLDER_TITLES = {"task", "todo", "tbd", "n/a", "none", "untitled"}
+
+
+def _reject_placeholder_title(value: str) -> str:
+    stripped = value.strip()
+    if stripped.lower() in _PLACEHOLDER_TITLES:
+        raise ValueError(
+            f"Task title {value!r} is a placeholder. A task needs a title that "
+            "says what it is, because the title is what dedup matches on."
+        )
+    return stripped
+
+
+class SubUnit(BaseModel):
+    """One independently-completable piece of a proposal that would otherwise
+    bundle several unrelated units of work into a single task.
+
+    Written by the planner itself, not derived by templating the parent's
+    title/description: the planner already has the context to scope each
+    unit correctly (which file, which source, which signal), and generating
+    N variations of one description mechanically would just produce N tasks
+    that all look like the same task with a different label stapled on,
+    which defeats the point of splitting them at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=4, max_length=300)
+    description: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("title")
+    @classmethod
+    def _title_is_not_a_placeholder(cls, value: str) -> str:
+        return _reject_placeholder_title(value)
+
 
 class ProposedTask(BaseModel):
     """One piece of work the planner wants done."""
@@ -27,19 +62,28 @@ class ProposedTask(BaseModel):
     rationale: str = Field(min_length=1, max_length=2000)
     #: 1 is most urgent, 200 is filler. The planner is told the scale.
     priority: int = Field(default=100, ge=1, le=200)
+    #: Set only when this proposal would otherwise bundle several independent
+    #: units of work (e.g. "detect the silent-failure mode of all 6 upstream
+    #: sources") into one task. Each entry becomes its own Task at enqueue
+    #: time -- own dedup match, own budget ceiling, own verify-loop attempt --
+    #: instead of one oversized task that can only fail as a whole. Empty is
+    #: the normal case: most proposals are already one coherent unit.
+    sub_units: list[SubUnit] = Field(default_factory=list, max_length=20)
 
     @field_validator("title")
     @classmethod
     def _title_is_not_a_placeholder(cls, value: str) -> str:
-        stripped = value.strip()
-        lowered = stripped.lower()
-        placeholders = {"task", "todo", "tbd", "n/a", "none", "untitled"}
-        if lowered in placeholders:
+        return _reject_placeholder_title(value)
+
+    @field_validator("sub_units")
+    @classmethod
+    def _sub_units_are_a_real_split(cls, value: list[SubUnit]) -> list[SubUnit]:
+        if len(value) == 1:
             raise ValueError(
-                f"Task title {value!r} is a placeholder. A task needs a title that "
-                "says what it is, because the title is what dedup matches on."
+                "sub_units has exactly one entry. A single unit is not a split: "
+                "leave sub_units empty and describe the whole task as usual."
             )
-        return stripped
+        return value
 
 
 class PlannerOutput(BaseModel):

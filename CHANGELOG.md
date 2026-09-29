@@ -5,6 +5,42 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-30
+
+Two confirmed instances of the same shape (task 13, task 22) plus a third
+overnight (the six-source analyst task failing again at 905k tokens) made
+this the next real fix: a single planner proposal bundling several
+independent, unrelated units of work into one task, which can only ever
+finish some of them and has no way to report on the rest.
+
+### Added
+
+- `ProposedTask.sub_units` (`schemas/planner.py`): a list of `SubUnit`
+  (title + description), written by the planner itself rather than
+  templated mechanically, since it already has the context to scope each
+  unit correctly. Exactly one entry is rejected by the schema (not a real
+  split); zero is the normal case and stays untouched.
+- `orchestrator._flatten_sub_units`: runs before the per-tick cap and
+  dedup, not after — expands a proposal with `sub_units` into one
+  synthetic `ProposedTask` per unit, each inheriting the parent's
+  `type`/`goal_key`/`rationale`/`priority` but with its own title and
+  description, so each unit gets its own dedup match, its own budget
+  ceiling, and its own verify-loop attempt instead of sharing one. The
+  parent proposal itself is never enqueued once split. A new
+  `ActivityKind.TASK_SPLIT` event records which units a proposal became.
+- The planner's system prompt now explicitly names this pattern and when
+  to use `sub_units` instead of describing bundled work as one task.
+
+### Changed
+
+- `PlannerOutput`'s JSON schema grew (the nested `SubUnit` definition adds
+  roughly 800 estimated tokens to every planner call's pre-dispatch size
+  check). Four `test_runner.py` watchdog tests had their token ceilings and
+  fake usage values scaled up proportionally (×3) so they still exercise
+  the mid-stream watchdog rather than being refused pre-dispatch by their
+  own deliberately tight ceilings; the boundary and crossing behaviour
+  they test is unchanged, just at a larger absolute scale.
+
 ## [0.7.0] - 2026-09-29
 
 Node/npm fixed run 40. Vendoring fixed tasks 9 and 10. The loop bound never

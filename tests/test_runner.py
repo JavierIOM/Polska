@@ -853,7 +853,7 @@ async def test_a_cutoff_run_recovers_a_valid_answer_the_model_already_gave(
     and the halt still stands), but the task itself must not be thrown away."""
     tight = app_config.model_copy(
         update={
-            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000}),
+            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 3_000}),
             "agents": {
                 **app_config.agents,
                 AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
@@ -871,7 +871,7 @@ async def test_a_cutoff_run_recovers_a_valid_answer_the_model_already_gave(
                 ToolUseBlock(id="tu_1", name="StructuredOutput", input={"input": valid_answer})
             ],
             model="claude-sonnet-5",
-            usage={"input_tokens": 2_000, "output_tokens": 0},
+            usage={"input_tokens": 6_000, "output_tokens": 0},
         )
 
     runner = AgentRunner(
@@ -914,7 +914,7 @@ async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     planner (see the separate per-agent-override test for that)."""
     tight = app_config.model_copy(
         update={
-            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000}),
+            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 3_000}),
             "agents": {
                 **app_config.agents,
                 AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
@@ -927,7 +927,7 @@ async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     pulled: list[str] = []
 
     async def fake(*, prompt: str, options: object):
-        for label, tokens in [("first", 500), ("second", 600), ("third", 10)]:
+        for label, tokens in [("first", 1_500), ("second", 1_800), ("third", 30)]:
             pulled.append(label)
             yield AssistantMessage(
                 content=[TextBlock(text=label)],
@@ -949,10 +949,10 @@ async def test_a_run_is_actively_cut_off_when_it_crosses_its_own_token_ceiling(
     assert outcome.output is None
     assert outcome.run.status == RunStatus.INTERRUPTED
     assert "ceiling" in outcome.run.error
-    # The generator was closed right after "second" pushed the total over 1,000;
+    # The generator was closed right after "second" pushed the total over 3,000;
     # "third" must never have been pulled at all.
     assert pulled == ["first", "second"]
-    assert outcome.run.input_tokens == 1_100
+    assert outcome.run.input_tokens == 3_300
 
     halt = session.execute(
         select(BudgetHalt).where(BudgetHalt.limit_name == "mid_run_watchdog")
@@ -976,17 +976,17 @@ async def test_a_per_agent_ceiling_override_is_what_the_watchdog_actually_checks
             "agents": {
                 **app_config.agents,
                 AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
-                    update={"max_tokens_per_run": 1_000}
+                    update={"max_tokens_per_run": 3_000}
                 ),
             }
         }
     )
-    assert overridden.budget.max_tokens_per_run > 1_000  # the global figure is untouched
+    assert overridden.budget.max_tokens_per_run > 3_000  # the global figure is untouched
     guard = BudgetGuard(overridden)
     pulled: list[str] = []
 
     async def fake(*, prompt: str, options: object):
-        for label, tokens in [("first", 500), ("second", 600), ("third", 10)]:
+        for label, tokens in [("first", 1_500), ("second", 1_800), ("third", 30)]:
             pulled.append(label)
             yield AssistantMessage(
                 content=[TextBlock(text=label)],
@@ -1026,7 +1026,7 @@ async def test_the_watchdog_does_not_fire_on_a_run_that_stays_at_or_under_its_ce
     planner."""
     tight = app_config.model_copy(
         update={
-            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 1_000}),
+            "budget": app_config.budget.model_copy(update={"max_tokens_per_run": 3_000}),
             "agents": {
                 **app_config.agents,
                 AgentName.PLANNER: app_config.agents[AgentName.PLANNER].model_copy(
@@ -1041,7 +1041,7 @@ async def test_the_watchdog_does_not_fire_on_a_run_that_stays_at_or_under_its_ce
     result_msg = _result_message(structured_output=output, model_usage=PLANNER_USAGE)
 
     async def fake(*, prompt: str, options: object):
-        for label, tokens in [("first", 500), ("second", 500)]:
+        for label, tokens in [("first", 1_500), ("second", 1_500)]:
             pulled.append(label)
             yield AssistantMessage(
                 content=[TextBlock(text=label)],

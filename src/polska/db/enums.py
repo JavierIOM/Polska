@@ -111,6 +111,7 @@ class ActivityKind(StrEnum):
     PLAN_STARTED = "plan_started"
     PLAN_COMPLETED = "plan_completed"
     TASK_ENQUEUED = "task_enqueued"
+    TASK_SPLIT = "task_split"
     TASK_DEDUPED = "task_deduped"
     TASK_STATE_CHANGED = "task_state_changed"
     RUN_STARTED = "run_started"
