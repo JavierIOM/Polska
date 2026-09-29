@@ -5,6 +5,41 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-09-30
+
+`runner.py` had, since phase 2 (24 Sep), only ever set `allowed_tools`
+(auto-approval only, moot under `bypassPermissions`) and never `tools`
+(the field that actually restricts which tools exist). Every agent has
+had the CLI's full default toolset regardless of its configured
+allowlist, for six days, across every real dispatched run. Reported last
+session; fixed now on explicit instruction rather than left open while a
+follow-on question was chased.
+
+### Fixed
+
+- `tools=list(agent_config.tools)` added alongside the existing
+  `allowed_tools=` in `ClaudeAgentOptions`. Two stale comments in the same
+  file corrected: both previously asserted `allowed_tools` was the actual
+  restriction, which is exactly the belief this closes.
+
+### Added
+
+- `test_the_configured_tool_list_actually_restricts_availability`
+  (`test_runner.py`): captures the real `ClaudeAgentOptions` passed to a
+  fake `query_fn` and asserts `options.tools` matches the agent's
+  configured list. Nothing previously asserted on either field.
+- `scripts/verify_webfetch_channel.sh`: checks by observation, not
+  documentation, whether `WebFetch` makes its own local network call
+  (which the uid-1001 iptables jail would catch) or is served through
+  Anthropic's hosted infrastructure (which the jail cannot see). Reads
+  the REJECT rule's own packet counter before and after a real WebFetch
+  call. Not yet run against the real droplet.
+- `scripts/verify_configured_tools.sh`: watches `/proc` for the real
+  `claude` CLI process during a live tick and prints its actual
+  `--tools`/`--allowedTools` flags, so the fix can be confirmed from
+  outside the Python source on a real dispatch, not just from a passing
+  test suite.
+
 ## [0.8.0] - 2026-09-30
 
 Two confirmed instances of the same shape (task 13, task 22) plus a third

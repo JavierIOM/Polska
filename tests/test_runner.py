@@ -136,6 +136,51 @@ async def test_a_successful_planner_run_validates_and_writes_a_run_row(
     assert outcome.run.session_id == "sess-1"
 
 
+async def test_the_configured_tool_list_actually_restricts_availability(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """The bug this closes: this file set ``allowed_tools`` (auto-approval
+    only, moot under bypassPermissions anyway) and never ``tools`` (what the
+    SDK's own subprocess_cli.py only ever turns into the CLI's ``--tools``
+    flag), so every agent ran with the CLI's full default toolset regardless
+    of its configured allowlist for the six days since this file was first
+    written. ``options.tools`` must equal the agent's configured list, not
+    just ``options.allowed_tools``, so a regression here fails a test
+    instead of six days passing unnoticed again."""
+    captured: dict[str, object] = {}
+
+    async def fake(*, prompt: str, options: object):
+        captured["options"] = options
+        yield _result_message(
+            structured_output={"succeeded": True, "summary": "done", "output": {}}
+        )
+
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=fake,
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.ENGINEER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Do the thing.",
+    )
+
+    configured = list(app_config.agents[AgentName.ENGINEER].tools)
+    assert configured, "the fixture config must give the engineer a non-empty allowlist"
+    assert captured["options"].tools == configured
+    assert captured["options"].allowed_tools == configured
+
+
 async def test_missing_structured_output_is_invalid_output_not_a_crash(
     session,
     app_config: AppConfig,

@@ -669,11 +669,25 @@ class AgentRunner:
 
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
+            # `tools` is what actually restricts which tools exist at all; the CLI
+            # only receives `--tools` when this is set to something other than
+            # None (confirmed in the SDK's own subprocess_cli.py). `allowed_tools`
+            # only controls auto-approval of an interactive permission prompt,
+            # which bypassPermissions below already makes moot regardless -- it
+            # was, on its own, never a restriction on availability. Found live,
+            # 30 Sep 2026: this file had only ever set allowed_tools since phase 2
+            # (24 Sep), so every agent has had the CLI's full default toolset
+            # (WebSearch, WebFetch, Task, NotebookEdit, ...) rather than its
+            # configured list. Both are set now, deliberately: allowed_tools stays
+            # harmless to keep even though bypassPermissions moots it, in case
+            # permission_mode is ever loosened later for some agent.
+            tools=list(agent_config.tools),
             allowed_tools=list(agent_config.tools),
-            # The tool allowlist is the security boundary, chosen deliberately per
-            # agent. There is nobody present to answer an interactive permission
-            # prompt in a scheduler that fires unattended, so prompting is not an
-            # option here; bypassPermissions is what running unattended means.
+            # There is nobody present to answer an interactive permission prompt
+            # in a scheduler that fires unattended, so prompting is not an option
+            # here; bypassPermissions is what running unattended means. `tools`
+            # above is what actually enforces the boundary this comment used to
+            # claim allowed_tools was providing.
             permission_mode="bypassPermissions",
             model=model,
             max_turns=agent_config.max_turns,
@@ -700,8 +714,8 @@ class AgentRunner:
             # completely unrelated to running a company. Measured directly: this
             # was inflating a single dedup judge call to 28k+ cached tokens before
             # this was set. An empty list is the SDK's own name for "load nothing
-            # from disk"; it is not related to allowed_tools, which still governs
-            # which tools the agent may call regardless of this setting.
+            # from disk"; it is not related to `tools` above, which governs which
+            # tools the agent may call regardless of this setting.
             setting_sources=[],
             effort=agent_config.effort,
         )
