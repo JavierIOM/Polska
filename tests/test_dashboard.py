@@ -299,6 +299,47 @@ def test_the_run_that_caused_a_halt_is_shown(
     assert f"run #{run.id}" in html.lower()
 
 
+def test_a_token_ceiling_halt_is_never_shown_with_a_dollar_sign(
+    client: TestClient, session: Session, company: Company
+) -> None:
+    """The exact incident this closes: a run-scoped max_tokens_per_run halt
+    rendered as "$773927.0000 against a limit of 750000" -- a token count
+    formatted as dollars. Both figures on this halt are token counts; neither
+    should ever carry a $."""
+    from polska.db.enums import AgentName
+
+    run = Run(
+        company_id=company.id,
+        agent=AgentName.ENGINEER,
+        model="claude-opus-5",
+        status=RunStatus.INTERRUPTED,
+        cost_usd=0.87,
+        input_tokens=700_000,
+        output_tokens=73_927,
+    )
+    session.add(run)
+    session.flush()
+    halt = BudgetHalt(
+        company_id=company.id,
+        run_id=run.id,
+        scope=BudgetScope.RUN,
+        limit_name="max_tokens_per_run",
+        limit_value=750_000,
+        observed_value=773_927,
+        reason=f"Run {run.id} used 773927 tokens against a same-model safety net of 750000.",
+    )
+    session.add(halt)
+    session.commit()
+
+    _login(client)
+    html = client.get("/budget").text
+
+    assert "$773927" not in html
+    assert "$750000" not in html
+    assert "773927 tokens" in html
+    assert "750000 tokens" in html
+
+
 def test_writing_off_an_orphan_via_the_route(
     client: TestClient, session: Session, company: Company
 ) -> None:

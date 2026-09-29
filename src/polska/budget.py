@@ -72,10 +72,16 @@ class BudgetExceeded(Exception):
 
     def __init__(self, halt: BudgetHalt) -> None:
         self.halt = halt
+        if halt.is_token_denominated:
+            figures = (
+                f"{halt.observed_value:.0f} tokens against a limit of "
+                f"{halt.limit_value:.0f} tokens"
+            )
+        else:
+            figures = f"${halt.observed_value:.4f} against a limit of ${halt.limit_value:.2f}"
         super().__init__(
             f"{halt.scope.value} ceiling '{halt.limit_name}' would be crossed: "
-            f"${halt.observed_value:.4f} against a limit of ${halt.limit_value:.2f}. "
-            f"{halt.reason}"
+            f"{figures}. {halt.reason}"
         )
 
 

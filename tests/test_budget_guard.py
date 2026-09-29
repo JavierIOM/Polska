@@ -243,6 +243,38 @@ async def test_an_active_halt_blocks_every_new_reservation_regardless_of_sums(
         )
 
 
+async def test_an_active_token_ceiling_halt_is_never_quoted_with_a_dollar_sign(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    """The exact incident this closes: an open run-scoped max_tokens_per_run
+    halt, re-raised by reserve()'s active_halt() check on every subsequent
+    dispatch attempt while it stays open, was rendered
+    "$773927.0000 against a limit of 750000.00" -- a token count formatted as
+    dollars, in the message that becomes Run.error and the activity feed."""
+    from polska.budget import write_halt
+
+    guard = BudgetGuard(tight_config)
+    write_halt(
+        session,
+        company_id=company.id,
+        scope=BudgetScope.RUN,
+        limit_name="max_tokens_per_run",
+        limit_value=750_000,
+        observed_value=773_927,
+        period_key=None,
+        reason="manually injected for the test",
+    )
+    with pytest.raises(BudgetExceeded) as excinfo:
+        await guard.reserve(
+            session, company_id=company.id, model="claude-sonnet-5", agent_name=AgentName.SUPPORT
+        )
+    message = str(excinfo.value)
+    assert "$773927" not in message
+    assert "$750000" not in message
+    assert "773927 tokens" in message
+    assert "750000 tokens" in message
+
+
 async def test_a_cleared_halt_no_longer_blocks(
     session: Session, tight_config: AppConfig, company: Company
 ) -> None:

@@ -5,6 +5,22 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-09-29
+
+### Fixed
+
+- A run-scoped `max_tokens_per_run` halt could render with a `$`, e.g.
+  `$773927.0000 against a limit of 750000`, a token count formatted as
+  dollars with four decimal places. Found on the dashboard's budget page, but
+  the same unconditional `$` formatting was also in `BudgetExceeded`'s own
+  message, so it was reaching `Run.error` and the activity feed too: every
+  dispatch blocked by an already-open token-ceiling halt (via `reserve()`'s
+  `active_halt()` check) got the mislabelled figure baked into a stored
+  error, not just a display glitch. `BudgetHalt.is_token_denominated` is now
+  the one place that decides this, used by both `BudgetExceeded.__init__` and
+  the template rather than each re-deriving `limit_name == 'max_tokens_per_run'`
+  on its own.
+
 ## [0.4.3] - 2026-09-29
 
 Found running the real deployment: every tick was failing, and the planner had

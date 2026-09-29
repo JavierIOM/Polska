@@ -13,8 +13,12 @@ Nothing here happens on its own.</p>
 <div class="card">
   <p>
     <span class="pill">{{ h.scope.value }}</span> <strong>{{ h.limit_name }}</strong>
-    &mdash; ${{ "%.4f"|format(h.observed_value) }} against a limit of
-    {% if h.scope.value == 'run' and h.limit_name == 'max_tokens_per_run' %}{{ h.limit_value|int }}{% else %}${{ "%.2f"|format(h.limit_value) }}{% endif %}
+    &mdash;
+    {% if h.is_token_denominated %}
+      {{ h.observed_value|int }} tokens against a limit of {{ h.limit_value|int }} tokens
+    {% else %}
+      {{ h.observed_value|money }} against a limit of {{ h.limit_value|money }}
+    {% endif %}
     <span class="muted">({{ h.created_at.strftime("%Y-%m-%d %H:%M") }})</span>
   </p>
   <p>{{ h.reason }}</p>

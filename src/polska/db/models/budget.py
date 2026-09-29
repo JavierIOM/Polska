@@ -65,6 +65,22 @@ class BudgetHalt(Base):
     company: Mapped[Company | None] = relationship(back_populates="halts")
     run: Mapped[Run | None] = relationship(back_populates="halts")
 
+    #: The one limit_name whose limit_value/observed_value are a token count, not
+    #: a dollar figure. Named here, once, as the single source of truth: a
+    #: mislabelled figure (a token count rendered with a $) is exactly the kind
+    #: of ungrounded-looking number this project has already been burned by once,
+    #: in the planner's prompt rather than a display -- see BudgetExceeded and
+    #: dashboard/templates/budget.html, both of which check this rather than
+    #: repeating the string literal.
+    _TOKEN_DENOMINATED_LIMIT_NAMES = frozenset({"max_tokens_per_run"})
+
+    @property
+    def is_token_denominated(self) -> bool:
+        """True if ``limit_value``/``observed_value`` are a token count, never a
+        dollar figure -- decides how a caller must format them, not just how
+        the dashboard happens to."""
+        return self.limit_name in self._TOKEN_DENOMINATED_LIMIT_NAMES
+
     @property
     def is_active(self) -> bool:
         """True if this halt is still stopping work."""
