@@ -5,6 +5,40 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-29
+
+Node/npm fixed run 40. Vendoring fixed tasks 9 and 10. The loop bound never
+got a chance to run: the engineer was inventing a writable working area by
+hand, mid-run, at real token cost, before it could ever attempt cycle 1.
+
+### Added
+
+- `<task_workspace>/work/`: a genuinely writable copy of the read-only
+  `repo/` clone, created once at workspace prep, with `node_modules`
+  symlinked rather than duplicated (it is already vendored once, at real
+  disk cost; copying several hundred MB a second time for a directory that
+  never needs editing would undo the reclaim policy's own point).
+  `repo/` stays exactly as it was, untouched, what a proposed change is
+  diffed against. Engineering tasks only; research never writes anything
+  and would just pay for a copy it cannot use. Self-heals via a completion
+  marker the same way `node_modules` vendoring does, and applies
+  retroactively to existing workspaces the same way too.
+- `polska.trace_analysis.summarize_verification_attempts`: derives how many
+  distinct verification attempts a run actually made from its own
+  `tools_called`, not from the model's self-reported
+  `iterations_attempted`. Built because that field is only ever set on a
+  run that finishes cleanly, since it is part of the model's own final
+  structured answer, and a run cut off by the token watchdog is exactly
+  the case with no such answer. Deduplicates two different invocation
+  methods for the same underlying attempt (found live: `npx vitest run`
+  then, after a permissions check that changed nothing, `node
+  node_modules/vitest/vitest.mjs run`) into one, using the same
+  edit-then-verify cycle boundary the loop bound itself describes.
+  Distinguishes "attempted" from "confirmed to have run" where the trace
+  allows it (an unpiped command's own exit status), and says plainly when
+  it cannot (a piped command's exit status reflects the pipe's last stage,
+  not necessarily the verification command).
+
 ## [0.6.0] - 2026-09-29
 
 Every engineer run traced this session was cut off by the token ceiling

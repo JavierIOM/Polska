@@ -512,9 +512,17 @@ async def _dispatch_one(
             # A read-only clone of the company's repo, if one is configured, so
             # engineering and research tasks alike have real code to read instead
             # of an empty directory. See workspace.py for how the credential is
-            # kept out of its reach.
+            # kept out of its reach. Only engineering also gets a writable copy
+            # (work/, alongside the read-only repo/): research never edits
+            # anything, so the copy would just be a wasted cost it structurally
+            # cannot use.
             try:
-                workspace = prepare_task_workspace(company_profile, workspace_root, task.id)
+                workspace = prepare_task_workspace(
+                    company_profile,
+                    workspace_root,
+                    task.id,
+                    needs_writable_copy=task.type is TaskType.ENGINEERING,
+                )
             except WorkspaceError as exc:
                 # The task never reached the agent, but it was still a real
                 # attempt (a broken repo slug, a dead token, a network outage),

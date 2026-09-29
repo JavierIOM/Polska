@@ -56,6 +56,9 @@ logger = logging.getLogger("polska.workspace")
 #: Kept separate from the workspace root so the engineer still has somewhere
 #: writable (the root) even though the clone itself is read-only.
 REPO_DIRNAME = "repo"
+#: The writable copy, alongside REPO_DIRNAME, for a task type that actually
+#: edits and verifies something. See _ensure_writable_copy.
+WORK_DIRNAME = "work"
 
 _CLONE_TIMEOUT_SECONDS = 120
 #: Covers both npm ci and its npm install fallback; installing a project's
@@ -100,10 +103,20 @@ class WorkspaceError(Exception):
 
 
 def prepare_task_workspace(
-    company_profile: CompanyProfile, workspace_root: Path, task_id: int
+    company_profile: CompanyProfile,
+    workspace_root: Path,
+    task_id: int,
+    *,
+    needs_writable_copy: bool = False,
 ) -> Path:
     """Ensure ``workspace_root/<task_id>/`` exists, with a read-only clone of the
     company's repository at ``<task_id>/repo/`` if one is configured.
+
+    ``needs_writable_copy`` additionally ensures a genuinely writable copy at
+    ``<task_id>/work/`` (see ``_ensure_writable_copy``), for a task type that
+    will actually edit and verify something -- pass ``True`` only for that
+    case (engineering), never for one that only ever reads (research), which
+    would just pay the copy's cost for a directory it structurally cannot use.
 
     Idempotent: called again for a retried task, an existing clone is left alone
     rather than re-fetched (a retry should see exactly what the first attempt saw
@@ -151,10 +164,14 @@ def prepare_task_workspace(
         # inferring.
         logger.info("Workspace for task %d already has a clone; leaving it as is.", task_id)
         _ensure_node_dependencies_vendored(repo_dir, task_id)
+        if needs_writable_copy:
+            _ensure_writable_copy(task_workspace, repo_dir, task_id)
         return task_workspace
 
     branch = github.options.get("working_branch") or github.options.get("default_branch") or "main"
     _clone_read_only(repo_slug, branch, repo_dir, github.secret_env, task_id)
+    if needs_writable_copy:
+        _ensure_writable_copy(task_workspace, repo_dir, task_id)
     return task_workspace
 
 
@@ -425,6 +442,79 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
             (Path(root) / name).chmod(0o777)
         for name in files:
             (Path(root) / name).chmod(0o666)
+
+
+#: Written into work/ only once the copy has genuinely finished. Same
+#: reasoning as _VENDORED_MARKER_NAME: "work/ exists" is not the same claim
+#: as "the copy that made it finished", and a container dying mid-copy would
+#: otherwise leave a half-written tree permanently indistinguishable from a
+#: real one.
+_WORK_READY_MARKER_NAME = ".polska-work-ready"
+
+
+def _ensure_writable_copy(task_workspace: Path, repo_dir: Path, task_id: int) -> None:
+    """Ensure ``<task_workspace>/work/`` exists: a genuinely writable copy of
+    the read-only ``repo/`` clone, source only, with ``node_modules``
+    symlinked in rather than duplicated.
+
+    Found live: without this, the engineer invents the same arrangement
+    itself, mid-run, at real token cost, the moment it discovers ``repo/``
+    cannot be written to and a test runner needs somewhere it can write (a
+    cache, a snapshot). This does it once, in Polska's own process, before
+    the agent ever starts, and the agent is told where to work in its own
+    system prompt rather than left to work it out.
+
+    Checked against a completion marker inside ``work/``, not against
+    whether the directory exists, for the identical reason
+    ``_ensure_node_dependencies_vendored`` is: existence alone is "something
+    was written here", not "the thing that wrote it finished".
+
+    ``node_modules`` is symlinked, never copied: it is already vendored once
+    at real disk cost (see that same function), and duplicating several
+    hundred MB a second time for a directory that never needs editing would
+    undo exactly the space discipline the reclaim policy exists for.
+
+    A no-op if ``repo_dir`` itself does not exist: no repository was
+    configured for this company at all, so there is nothing to copy.
+    """
+    if not repo_dir.exists():
+        return
+
+    work_dir = task_workspace / WORK_DIRNAME
+    marker = work_dir / _WORK_READY_MARKER_NAME
+    if marker.exists():
+        return
+
+    if work_dir.exists():
+        logger.warning(
+            "Task %d's work/ exists without a completion marker (a partial "
+            "copy, or one that predates the marker); removing it and "
+            "recreating it from scratch rather than trust it.",
+            task_id,
+        )
+        _force_rmtree(work_dir)
+
+    shutil.copytree(repo_dir, work_dir, ignore=shutil.ignore_patterns("node_modules"))
+
+    node_modules_source = repo_dir / "node_modules"
+    if node_modules_source.exists():
+        (work_dir / "node_modules").symlink_to(node_modules_source, target_is_directory=True)
+
+    # copytree preserves the source's own mode bits, which for a repo_dir
+    # already locked read-only (see _make_read_only) means no write bit for
+    # "other" at all -- exactly the thing this directory exists not to be.
+    # Same world-writable simplification as node_modules gets, for the same
+    # reason: this is the agent's own scratch copy, never a secret.
+    work_dir.chmod(0o777)
+    for root, dirs, files in os.walk(work_dir):
+        if "node_modules" in dirs:
+            dirs.remove("node_modules")  # a symlink, not a real tree to chmod
+        for name in dirs:
+            (Path(root) / name).chmod(0o777)
+        for name in files:
+            (Path(root) / name).chmod(0o666)
+
+    marker.write_text("ready\n", encoding="utf-8")
 
 
 def _strip_low_value_files(repo_dir: Path) -> None:

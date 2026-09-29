@@ -8,6 +8,7 @@ enforcement and the credential-never-touches-disk claim are all provable locally
 from __future__ import annotations
 
 import datetime as dt
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -579,6 +580,126 @@ def test_a_freshly_writable_clone_is_never_chmodded_by_vendoring(
     _ensure_node_dependencies_vendored(tmp_path, task_id=1)
 
     assert chmod_calls == []
+
+
+# -------------------------------------------------------------- writable copy
+
+
+def _repo_with_node_modules(tmp_path: Path) -> Path:
+    repo_dir = tmp_path / "1" / REPO_DIRNAME
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "index.ts").write_text("export const x = 1;\n", encoding="utf-8")
+    (repo_dir / "package.json").write_text("{}", encoding="utf-8")
+    (repo_dir / "node_modules" / "some-package").mkdir(parents=True)
+    (repo_dir / "node_modules" / "some-package" / "index.js").write_text(
+        "module.exports = {};\n", encoding="utf-8"
+    )
+    return repo_dir
+
+
+def test_writable_copy_is_created_alongside_the_read_only_clone(tmp_path: Path) -> None:
+    from polska.workspace import WORK_DIRNAME, _ensure_writable_copy
+
+    repo_dir = _repo_with_node_modules(tmp_path)
+    task_workspace = tmp_path / "1"
+
+    _ensure_writable_copy(task_workspace, repo_dir, task_id=1)
+
+    work_dir = task_workspace / WORK_DIRNAME
+    assert (work_dir / "src" / "index.ts").read_text(encoding="utf-8") == "export const x = 1;\n"
+    # Writable, unlike the source it was copied from would be once locked.
+    (work_dir / "src" / "index.ts").write_text("export const x = 2;\n", encoding="utf-8")
+
+
+def test_node_modules_is_symlinked_not_duplicated(tmp_path: Path) -> None:
+    from polska.workspace import _ensure_writable_copy
+
+    repo_dir = _repo_with_node_modules(tmp_path)
+    task_workspace = tmp_path / "1"
+
+    _ensure_writable_copy(task_workspace, repo_dir, task_id=1)
+
+    work_node_modules = task_workspace / "work" / "node_modules"
+    assert work_node_modules.is_symlink()
+    assert work_node_modules.resolve() == (repo_dir / "node_modules").resolve()
+
+
+def test_a_repo_with_no_node_modules_gets_a_copy_with_no_symlink(tmp_path: Path) -> None:
+    """Not every company's repository is a Node project; the symlink step
+    must not assume node_modules exists at all."""
+    from polska.workspace import _ensure_writable_copy
+
+    repo_dir = tmp_path / "1" / REPO_DIRNAME
+    (repo_dir / "notes.md").parent.mkdir(parents=True)
+    (repo_dir / "notes.md").write_text("plain repo, no node project", encoding="utf-8")
+    task_workspace = tmp_path / "1"
+
+    _ensure_writable_copy(task_workspace, repo_dir, task_id=1)
+
+    work_dir = task_workspace / "work"
+    assert (work_dir / "notes.md").exists()
+    assert not (work_dir / "node_modules").exists()
+
+
+def test_writable_copy_is_a_no_op_without_a_repo_at_all(tmp_path: Path) -> None:
+    from polska.workspace import _ensure_writable_copy
+
+    task_workspace = tmp_path / "1"
+    task_workspace.mkdir(parents=True)
+    _ensure_writable_copy(task_workspace, task_workspace / REPO_DIRNAME, task_id=1)
+
+    assert not (task_workspace / "work").exists()
+
+
+def test_writable_copy_is_skipped_once_the_ready_marker_exists(tmp_path: Path, monkeypatch) -> None:
+    from polska.workspace import WORK_DIRNAME, _ensure_writable_copy
+
+    repo_dir = _repo_with_node_modules(tmp_path)
+    task_workspace = tmp_path / "1"
+    work_dir = task_workspace / WORK_DIRNAME
+    work_dir.mkdir()
+    (work_dir / ".polska-work-ready").write_text("ready\n", encoding="utf-8")
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("must not recopy once the ready marker exists")
+
+    monkeypatch.setattr(shutil, "copytree", _fail_if_called)
+    _ensure_writable_copy(task_workspace, repo_dir, task_id=1)  # must not raise
+
+
+def test_a_partial_copy_without_the_marker_is_redone(tmp_path: Path, caplog) -> None:
+    """The exact gap this closes, same shape as node_modules's own: a
+    container dying mid-copy leaves work/ existing but incomplete,
+    permanently indistinguishable from a real one without a marker."""
+    from polska.workspace import WORK_DIRNAME, _ensure_writable_copy
+
+    repo_dir = _repo_with_node_modules(tmp_path)
+    task_workspace = tmp_path / "1"
+    work_dir = task_workspace / WORK_DIRNAME
+    (work_dir / "half-copied").mkdir(parents=True)  # no .polska-work-ready
+
+    with caplog.at_level("WARNING", logger="polska.workspace"):
+        _ensure_writable_copy(task_workspace, repo_dir, task_id=1)
+
+    assert any("without a completion marker" in r.getMessage() for r in caplog.records)
+    assert not (work_dir / "half-copied").exists()
+    assert (work_dir / "src" / "index.ts").exists()
+    assert (work_dir / ".polska-work-ready").exists()
+
+
+def test_engineering_tasks_get_a_writable_copy_research_does_not(
+    tmp_path, local_repo, monkeypatch
+) -> None:
+    """prepare_task_workspace's own gate: only a task type that will actually
+    edit something pays for the copy."""
+    profile = _profile_with_repo(local_repo)
+
+    monkeypatch.setattr("polska.workspace._clone_read_only", _make_local_clone(local_repo))
+    prepare_task_workspace(profile, tmp_path, task_id=1, needs_writable_copy=True)
+    prepare_task_workspace(profile, tmp_path, task_id=2, needs_writable_copy=False)
+
+    assert (tmp_path / "1" / "work").exists()
+    assert not (tmp_path / "2" / "work").exists()
 
 
 # ---------------------------------------------------------------- reclaiming

@@ -111,20 +111,29 @@ If the company has a repository, a read-only checkout of its working branch is a
 ./repo relative to your workspace, with its dependencies already installed if it
 is a Node project. Read and search it freely to understand real code before
 proposing anything. You cannot write to it, by filesystem permission, not just
-instruction: propose any change as a description or a diff in your result, never
-by editing a file under ./repo directly. If ./repo does not exist, none was
-configured for this company; say so rather than assuming one.
+instruction, and this is deliberate, not an oversight to work around: ./repo is
+what your change gets diffed against, and it has to stay untouched for that
+comparison to mean anything. If ./repo does not exist, none was configured for
+this company; say so rather than assuming one.
+
+A second copy, identical to ./repo but genuinely writable, is at ./work, with the
+same dependencies already reachable there too. Make your changes in ./work, and
+run your verification commands from ./work, not ./repo. This is a fact about the
+environment, not something to work out for yourself: do not copy files elsewhere,
+symlink anything, or otherwise construct your own writable area, one is already
+there and already set up.
 
 Grep and Glob for what you need rather than reading a large file in full. A data
 file or generated asset can run to tens of thousands of tokens for no benefit
 over a targeted search; reading one wholesale, especially more than once, is the
 single most likely way to run this task over its budget. The same applies to
-node_modules if one exists: it is there only so an existing test command can run,
-never something worth reading through.
+node_modules if one exists, in either ./repo or ./work: it is there only so an
+existing test command can run, never something worth reading through.
 
-Do the work described in the task. If it requires a commit, prepare it, but you
-cannot push: a push to the default branch is an irreversible action and goes through
-the approval gate, so describe it as an action rather than attempting it directly.
+Do the work described in the task, in ./work. If it requires a commit, prepare it,
+but you cannot push: a push to the default branch is an irreversible action and
+goes through the approval gate, so describe it as an action rather than attempting
+it directly.
 {_ACTION_CONTRACT}
 {_BLOCKED_OUTCOME_NOTE}
 {_VERIFY_LOOP_BOUND}
