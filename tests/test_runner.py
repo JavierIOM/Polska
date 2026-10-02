@@ -1170,3 +1170,105 @@ async def test_the_pre_dispatch_check_refuses_without_ever_calling_the_sdk(
     ).scalar_one()
     assert halt.scope == BudgetScope.RUN
     assert halt.observed_value > tight.budget.max_usd_per_run
+
+
+# ----------------------------------------------------- planner retry on invalid output
+
+
+def _sequenced_query(*sequences: list[object]):
+    """A ``query_fn`` that replays one message sequence per call, in order, and
+    records the prompt each call received. A call beyond the last sequence raises
+    IndexError, so a runaway retry loop fails the test instead of passing quietly."""
+    prompts: list[str] = []
+    remaining = list(sequences)
+
+    async def fake(*, prompt: str, options: object) -> AsyncIterator[object]:
+        prompts.append(prompt)
+        for message in remaining.pop(0):
+            yield message
+
+    fake.prompts = prompts  # type: ignore[attr-defined]
+    return fake
+
+
+# No no_action_reason: the exact shape of the reply rejected live on 2 Oct 2026.
+_REJECTED_PLAN = {"assessment": "Remaining budget is small.", "tasks": []}
+_ACCEPTED_PLAN = {"tasks": [], "no_action_reason": "Nothing worth doing this cycle."}
+
+
+def _planner_runner(app_config, budget_guard, registry, query):
+    return AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=query,
+    )
+
+
+async def test_a_planner_reply_that_fails_validation_is_retried_with_the_reason(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    query = _sequenced_query(
+        [_result_message(structured_output=_REJECTED_PLAN, model_usage=PLANNER_USAGE)],
+        [_result_message(structured_output=_ACCEPTED_PLAN, model_usage=PLANNER_USAGE)],
+    )
+    runner = _planner_runner(app_config, budget_guard, registry, query)
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.run.status == RunStatus.SUCCEEDED
+    assert outcome.output is not None
+    assert outcome.output.is_empty
+    assert query.prompts[0] == "What next?"
+    assert query.prompts[1].startswith("What next?")
+    assert "rejected by validation" in query.prompts[1]
+    assert "no_action_reason" in query.prompts[1]
+    statuses = [r.status for r in session.execute(select(Run).order_by(Run.id)).scalars()]
+    assert statuses == [RunStatus.INVALID_OUTPUT, RunStatus.SUCCEEDED]
+
+
+async def test_a_planner_that_fails_validation_twice_gives_up_after_one_retry(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    query = _sequenced_query(
+        [_result_message(structured_output=_REJECTED_PLAN, model_usage=PLANNER_USAGE)],
+        [_result_message(structured_output=_REJECTED_PLAN, model_usage=PLANNER_USAGE)],
+    )
+    runner = _planner_runner(app_config, budget_guard, registry, query)
+
+    outcome = await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert outcome.output is None
+    assert outcome.run.status == RunStatus.INVALID_OUTPUT
+    assert len(query.prompts) == 2
+
+
+async def test_a_valid_planner_reply_is_not_retried(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+) -> None:
+    query = _sequenced_query(
+        [_result_message(structured_output=_ACCEPTED_PLAN, model_usage=PLANNER_USAGE)],
+    )
+    runner = _planner_runner(app_config, budget_guard, registry, query)
+
+    await runner.run_planner(
+        session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+    )
+
+    assert len(query.prompts) == 1

@@ -244,6 +244,11 @@ class _RunningUsage:
         return None
 
 
+#: Further tries the planner gets after output that fails validation. Cheap (a planner
+#: run costs cents) against losing a whole day's planning to one malformed reply.
+_PLANNER_INVALID_OUTPUT_RETRIES = 1
+
+
 class AgentRunner:
     """Executes one agent invocation at a time, fully accounted for.
 
@@ -286,19 +291,46 @@ class AgentRunner:
         company_profile: CompanyProfile,
         user_prompt: str,
     ) -> InvocationResult:
-        """One planner cycle. No task, no tools, no gate: it only proposes."""
+        """One planner cycle. No task, no tools, no gate: it only proposes.
+
+        Output that fails validation gets ``_PLANNER_INVALID_OUTPUT_RETRIES`` more
+        tries, each a fresh run (own row, own reservation) told what was wrong. The
+        planner fires once a day, so a single malformed reply would otherwise cost the
+        whole cycle; seen live 2 Oct 2026, a structured-output call came back with its
+        own tag syntax inside a string field.
+        """
         from polska.schemas.planner import PlannerOutput
 
-        return await self._invoke(
+        prompt = user_prompt
+        outcome = await self._invoke(
             session,
             agent_name=AgentName.PLANNER,
             company_id=company_id,
             task=None,
             company_profile=company_profile,
-            user_prompt=user_prompt,
+            user_prompt=prompt,
             schema_model=PlannerOutput,
             cwd=None,
         )
+        for _ in range(_PLANNER_INVALID_OUTPUT_RETRIES):
+            if outcome.run.status != RunStatus.INVALID_OUTPUT:
+                break
+            prompt = (
+                f"{user_prompt}\n\nYour previous reply was rejected by validation, so "
+                f"nothing was acted on. The problem was:\n{(outcome.run.error or '')[:800]}\n\n"
+                "Reply again with one valid structured result."
+            )
+            outcome = await self._invoke(
+                session,
+                agent_name=AgentName.PLANNER,
+                company_id=company_id,
+                task=None,
+                company_profile=company_profile,
+                user_prompt=prompt,
+                schema_model=PlannerOutput,
+                cwd=None,
+            )
+        return outcome
 
     async def run_dedup_judge(
         self,

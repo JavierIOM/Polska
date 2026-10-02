@@ -5,6 +5,71 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-10-02
+
+Follow-up to a full review of the repo after the scheduled ticks on 1 and 2 Oct
+produced nothing. 0.8.2 stopped one crash but was not checked as the real scheduler
+user (it was ticked by hand through `docker compose exec`, which runs as root and
+through a separate copy of the tick code), and when checked properly it deleted
+nothing, left `node_modules` at mode `0200` and still reported it as reclaimed.
+
+### Added
+
+- `run_tick_cycle` in `orchestrator.py`: the one function both the scheduler job and
+  `polska-cli tick` now run, returning a `CycleResult` (per-company summaries, which
+  companies failed).
+- `TickSummary.planner_status` / `planner_error`, logged and printed
+  (`planner=invalid_output ...`), so `proposed=0` can no longer mean either "chose to
+  do nothing" or "its output was rejected". The CLI exits 1 on a failed company or a
+  planner run that did not succeed.
+- One retry for a planner reply that fails validation, with the validation error in
+  the prompt. A malformed structured-output reply on 2 Oct 2026 cost the whole daily
+  cycle; the retry costs a few cents.
+- `scripts/` is now copied into the image. Every documented
+  `docker compose exec ... sh scripts/...` (README, wiki, the three verify scripts)
+  failed with "No such file" because it never was.
+- Tests: housekeeping isolation and ordering, planner status, planner retry,
+  reclaim accounting, `_force_rmtree` behaviour. The existing `test_main.py` fake
+  runner had no `budget_guard`, so its "healthy" ticks were crashing and being
+  swallowed; it now completes a real tick and the tests assert on the result.
+
+### Changed
+
+- Housekeeping (reconcile removed companies, reclaim `node_modules`) now brackets
+  the company ticks and each half is isolated: a failure is logged and skipped
+  instead of cancelling every company's planning for the day (the 1 and 2 Oct
+  incident).
+- `polska-cli tick` calls `run_tick_cycle` instead of its own copy of the loop.
+- `_force_rmtree` returns whether the tree is really gone. A partial `node_modules`
+  or `work/` that cannot be removed now raises `WorkspaceError` (the task fails
+  properly) instead of being built on top of.
+
+### Fixed
+
+- Reclaim counts a workspace only if its `node_modules` is actually gone, warns about
+  the ones it could not clear, and carries on past one it cannot touch.
+- The permission handler added bits instead of replacing the mode: the old
+  `chmod(path, S_IWRITE)` is exactly `0o200`, which strips read and execute from a
+  directory and left `node_modules` untraversable. It also now fixes the parent
+  directory's write bit, which is what actually blocks an unlink on Linux.
+- `docker-compose.yml`, README and `verify_configured_tools.sh` now say to tick with
+  `--user polska`, as the compose file already did.
+
+### Known issues (found, not fixed here)
+
+- **The scheduler process cannot launch agents.** The entrypoint starts it with
+  `--no-new-privs` (added in 0.5.0), which blocks `polska-agent-cli`'s
+  `setpriv --reuid=1001` (`setresuid failed: Operation not permitted`; checked on the
+  droplet against PID 1: uid 1000, `NoNewPrivs: 1`). The agent runs recorded since 29 Sep
+  sit in tight clusters that look like manual `exec` ticks, which skip the entrypoint;
+  I have not proved that none ever came from the schedule. Needs a decision on the
+  privilege model, not a quiet edit.
+- Files a test run creates as the agent user inside `node_modules` (vitest's
+  `.vite/` cache) cannot be deleted by the scheduler user, so reclaim now reports them
+  instead of hiding them but still does not free the space.
+- The planner reads its own `max_budget_usd` ($0.25) as the day's remaining budget and
+  declines to plan, even though its prompt says $10.00. The retry does not fix this.
+
 ## [0.8.2] - 2026-10-02
 
 The `reclaim_node_modules_for_terminal_tasks` cleanup crashed on every tick

@@ -8,8 +8,11 @@ enforcement and the credential-never-touches-disk claim are all provable locally
 from __future__ import annotations
 
 import datetime as dt
+import os
 import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -522,9 +525,7 @@ def test_retroactive_vendoring_temporarily_unlocks_and_relocks_a_read_only_clone
     monkeypatch.setattr(workspace_module.os, "access", lambda *a, **kw: False)  # "locked"
     chmod_calls: list[int] = []
     monkeypatch.setattr(Path, "chmod", lambda self, mode: chmod_calls.append(mode))
-    monkeypatch.setattr(
-        subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0)
-    )
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0))
 
     _ensure_node_dependencies_vendored(tmp_path, task_id=9)
 
@@ -534,9 +535,7 @@ def test_retroactive_vendoring_temporarily_unlocks_and_relocks_a_read_only_clone
     assert chmod_calls == [0o755, 0o555]
 
 
-def test_a_locked_clone_stays_locked_if_the_install_itself_fails(
-    tmp_path, monkeypatch
-) -> None:
+def test_a_locked_clone_stays_locked_if_the_install_itself_fails(tmp_path, monkeypatch) -> None:
     """The relock has to happen even when npm fails, or a workspace that was
     read-only before this ran ends up writable after a failed attempt --
     exactly the kind of half-finished state this project refuses to leave
@@ -560,9 +559,7 @@ def test_a_locked_clone_stays_locked_if_the_install_itself_fails(
     assert chmod_calls == [0o755, 0o555]  # relocked even though the install raised
 
 
-def test_a_freshly_writable_clone_is_never_chmodded_by_vendoring(
-    tmp_path, monkeypatch
-) -> None:
+def test_a_freshly_writable_clone_is_never_chmodded_by_vendoring(tmp_path, monkeypatch) -> None:
     """The non-retroactive case (a brand new clone, already writable) must
     take no lock/unlock action at all: _make_read_only runs right after this
     and is what applies the real lockdown, exactly once, the same as always."""
@@ -573,9 +570,7 @@ def test_a_freshly_writable_clone_is_never_chmodded_by_vendoring(
     monkeypatch.setattr(workspace_module.os, "access", lambda *a, **kw: True)  # "writable"
     chmod_calls: list[int] = []
     monkeypatch.setattr(Path, "chmod", lambda self, mode: chmod_calls.append(mode))
-    monkeypatch.setattr(
-        subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0)
-    )
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0))
 
     _ensure_node_dependencies_vendored(tmp_path, task_id=1)
 
@@ -793,3 +788,169 @@ def test_reclaim_is_a_no_op_when_there_is_nothing_to_reclaim(session, company, t
 def _make_workspace_from_local(tmp_path, profile, local_repo, monkeypatch, *, task_id: int) -> Path:
     monkeypatch.setattr("polska.workspace._clone_read_only", _make_local_clone(local_repo))
     return prepare_task_workspace(profile, tmp_path, task_id)
+
+
+# ------------------------------------------------- removing trees that will not go
+
+
+def test_force_rmtree_removes_a_tree_and_reports_it(tmp_path: Path) -> None:
+    import polska.workspace as workspace_module
+
+    tree = tmp_path / "tree"
+    (tree / "a" / "b").mkdir(parents=True)
+    (tree / "a" / "b" / "f.txt").write_text("x", encoding="utf-8")
+
+    assert workspace_module._force_rmtree(tree) is True
+    assert not tree.exists()
+
+
+def test_force_rmtree_on_a_missing_path_is_a_quiet_success(tmp_path: Path) -> None:
+    import polska.workspace as workspace_module
+
+    assert workspace_module._force_rmtree(tmp_path / "never-existed") is True
+
+
+def test_force_rmtree_reports_a_tree_it_could_not_delete_instead_of_raising(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The failure that stopped every scheduled tick: a file owned by another user
+    (the agent UID) that this process can neither chmod nor unlink."""
+    import polska.workspace as workspace_module
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    stuck = tree / "results.json"
+    stuck.write_text("{}", encoding="utf-8")
+
+    def fake_rmtree(path, onexc):
+        onexc(os.unlink, str(stuck), PermissionError(13, "Permission denied"))
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(workspace_module.shutil, "rmtree", fake_rmtree)
+    monkeypatch.setattr(workspace_module.os, "chmod", refuse)
+
+    assert workspace_module._force_rmtree(tree) is False
+    assert stuck.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")
+def test_force_rmtree_never_strips_a_directorys_read_and_execute_bits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The old handler did chmod(path, S_IWRITE), which is exactly mode 0o200: on a
+    directory that removes read and execute and leaves nothing able to enter it."""
+    import polska.workspace as workspace_module
+
+    tree = tmp_path / "tree"
+    sub = tree / "sub"
+    sub.mkdir(parents=True)
+    sub.chmod(0o755)
+    before = stat.S_IMODE(sub.stat().st_mode)
+
+    def always_denied(target):
+        raise PermissionError(13, "Permission denied")
+
+    def fake_rmtree(path, onexc):
+        onexc(always_denied, str(sub), PermissionError(13, "Permission denied"))
+
+    monkeypatch.setattr(workspace_module.shutil, "rmtree", fake_rmtree)
+    workspace_module._force_rmtree(tree)
+
+    after = stat.S_IMODE(sub.stat().st_mode)
+    assert after & before == before
+    assert after & stat.S_IRUSR
+    assert after & stat.S_IXUSR
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs real POSIX permissions and a non-root user",
+)
+def test_force_rmtree_removes_files_inside_a_read_only_directory(tmp_path: Path) -> None:
+    """On POSIX it is the parent directory's write bit that blocks the unlink, which
+    the old handler (it chmod'd the file itself) never fixed."""
+    import polska.workspace as workspace_module
+
+    tree = tmp_path / "tree"
+    sub = tree / "sub"
+    sub.mkdir(parents=True)
+    (sub / "f.txt").write_text("x", encoding="utf-8")
+    sub.chmod(0o555)
+
+    assert workspace_module._force_rmtree(tree) is True
+    assert not tree.exists()
+
+
+def test_reclaim_does_not_count_a_workspace_it_could_not_clear(
+    session, company, tmp_path, monkeypatch
+) -> None:
+    old_enough = utcnow() - dt.timedelta(hours=48)
+    task = _terminal_task(session, company, TaskState.DONE, finished_at=old_enough)
+    node_modules = tmp_path / str(task.id) / REPO_DIRNAME / "node_modules"
+    (node_modules / "some-package").mkdir(parents=True)
+    monkeypatch.setattr("polska.workspace._force_rmtree", lambda path: False)
+
+    reclaimed = reclaim_node_modules_for_terminal_tasks(
+        session, tmp_path, grace_period=dt.timedelta(hours=24)
+    )
+
+    assert reclaimed == 0
+    assert node_modules.exists()
+
+
+def test_reclaim_carries_on_past_a_workspace_it_cannot_touch(
+    session, company, tmp_path, monkeypatch
+) -> None:
+    import polska.workspace as workspace_module
+
+    old_enough = utcnow() - dt.timedelta(hours=48)
+    stuck = _terminal_task(session, company, TaskState.DONE, finished_at=old_enough)
+    fine = _terminal_task(session, company, TaskState.DONE, finished_at=old_enough)
+    stuck_modules = tmp_path / str(stuck.id) / REPO_DIRNAME / "node_modules"
+    fine_modules = tmp_path / str(fine.id) / REPO_DIRNAME / "node_modules"
+    (stuck_modules / "pkg").mkdir(parents=True)
+    (fine_modules / "pkg").mkdir(parents=True)
+
+    real = workspace_module._force_rmtree
+
+    def selective(path):
+        if str(stuck.id) in Path(path).parts:
+            raise PermissionError(13, "Permission denied")
+        return real(path)
+
+    monkeypatch.setattr("polska.workspace._force_rmtree", selective)
+
+    reclaimed = reclaim_node_modules_for_terminal_tasks(
+        session, tmp_path, grace_period=dt.timedelta(hours=24)
+    )
+
+    assert reclaimed == 1
+    assert stuck_modules.exists()
+    assert not fine_modules.exists()
+
+
+def test_a_partial_node_modules_that_will_not_delete_fails_loudly(tmp_path, monkeypatch) -> None:
+    import polska.workspace as workspace_module
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / "node_modules" / "pkg").mkdir(parents=True)
+    (repo_dir / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workspace_module, "_force_rmtree", lambda path: False)
+
+    with pytest.raises(WorkspaceError, match="partial node_modules"):
+        workspace_module._ensure_node_dependencies_vendored(repo_dir, task_id=7)
+
+
+def test_a_partial_work_copy_that_will_not_delete_fails_loudly(tmp_path, monkeypatch) -> None:
+    import polska.workspace as workspace_module
+
+    task_workspace = tmp_path / "7"
+    repo_dir = task_workspace / "repo"
+    repo_dir.mkdir(parents=True)
+    (task_workspace / "work").mkdir()
+    monkeypatch.setattr(workspace_module, "_force_rmtree", lambda path: False)
+
+    with pytest.raises(WorkspaceError, match=r"partial work/"):
+        workspace_module._ensure_writable_copy(task_workspace, repo_dir, task_id=7)

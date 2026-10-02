@@ -212,12 +212,27 @@ def reclaim_node_modules_for_terminal_tasks(
         if not node_modules.exists():
             continue
         repo_dir = node_modules.parent
-        was_locked = not os.access(repo_dir, os.W_OK)
-        if was_locked:
-            repo_dir.chmod(0o755)
-        _force_rmtree(node_modules)
-        if was_locked:
-            repo_dir.chmod(0o555)
+        try:
+            was_locked = not os.access(repo_dir, os.W_OK)
+            if was_locked:
+                repo_dir.chmod(0o755)
+            try:
+                removed = _force_rmtree(node_modules)
+            finally:
+                if was_locked:
+                    repo_dir.chmod(0o555)
+        except OSError as exc:
+            # One workspace this process cannot touch must not stop the rest.
+            logger.warning("Could not reclaim node_modules for task %d: %s", task.id, exc)
+            continue
+        if not removed:
+            logger.warning(
+                "node_modules for terminal task %d is only partly removed: what is left is "
+                "not deletable by this process (typically files a test run created as the "
+                "agent user). Not counted as reclaimed; retried next cycle.",
+                task.id,
+            )
+            continue
         reclaimed += 1
         logger.info("Reclaimed node_modules for terminal task %d.", task.id)
     return reclaimed
@@ -368,7 +383,13 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
             "and reinstalling from scratch rather than trust it.",
             task_id,
         )
-        _force_rmtree(node_modules)
+        if not _force_rmtree(node_modules):
+            if was_locked:
+                repo_dir.chmod(0o555)
+            raise WorkspaceError(
+                f"Could not remove task {task_id}'s partial node_modules to reinstall it; "
+                "refusing to layer a fresh install on top of an unknown partial one."
+            )
 
     lockfile = repo_dir / "package-lock.json"
     if lockfile.exists():
@@ -492,7 +513,11 @@ def _ensure_writable_copy(task_workspace: Path, repo_dir: Path, task_id: int) ->
             "recreating it from scratch rather than trust it.",
             task_id,
         )
-        _force_rmtree(work_dir)
+        if not _force_rmtree(work_dir):
+            raise WorkspaceError(
+                f"Could not remove task {task_id}'s partial work/ copy to recreate it; "
+                "refusing to copy on top of an unknown partial one."
+            )
 
     shutil.copytree(repo_dir, work_dir, ignore=shutil.ignore_patterns("node_modules"))
 
@@ -560,30 +585,46 @@ def _read_token(secret_env_names: list[str]) -> str | None:
     return None
 
 
-def _force_rmtree(path: Path) -> None:
-    """Delete a tree even when some files in it are read-only.
+def _force_rmtree(path: Path) -> bool:
+    """Delete a tree even when some of it is read-only. Returns True only if
+    ``path`` is actually gone afterwards; never raises for a permission problem.
 
     git marks some of its own files (pack files in particular) read-only on
     Windows, and a plain ``shutil.rmtree`` fails to delete them; passing
     ``ignore_errors=True`` "fixes" that by silently leaving them behind, which is
     exactly wrong for a directory whose entire purpose is to not exist afterwards.
-    The standard fix: on a permission error, clear the read-only bit and retry.
+    So: on an error, add the owner write bit and retry, then report whether the
+    tree really went. Callers decide what a tree that would not go means.
+
+    A file owned by another user (a test runner's cache, written as the agent
+    UID into a tree this process owns) cannot be fixed from here: it stays, and
+    the False return says so, rather than the old behaviour of either raising
+    and killing the whole tick or pretending it worked.
     """
+    root = Path(path)
+
+    def _add_owner_bits(target: Path, bits: int) -> None:
+        # Add, never replace: chmod(dir, S_IWRITE) sets the mode to exactly 0o200,
+        # which strips read and execute and leaves a directory nothing can enter.
+        os.chmod(target, stat.S_IMODE(target.lstat().st_mode) | bits)
 
     def _on_error(func, target_path, exc_info):  # noqa: ANN001 - shutil's onexc signature
+        target = Path(target_path)
+        parent = target.parent
         try:
-            os.chmod(target_path, stat.S_IWRITE)
+            # On POSIX it is the parent directory's write bit that blocks unlink and
+            # rmdir; on Windows it is the file's own read-only attribute. Only ever
+            # touch directories inside the tree being deleted.
+            if parent == root or root in parent.parents:
+                _add_owner_bits(parent, stat.S_IWUSR | stat.S_IXUSR)
+            if not target.is_symlink():
+                _add_owner_bits(target, stat.S_IWUSR)
             func(target_path)
-        except (PermissionError, OSError):
-            # File is owned by a different UID (e.g., agent UID 1001, scheduler UID 1000),
-            # and we can't change its permissions or delete it. Skip it: cleanup of old
-            # artifacts is best-effort, and a stray file from a past run does not block
-            # future work. A subsequent cleanup attempt (next 24h) may succeed if the file
-            # gets touched in a way that changes its ownership or permissions, or if the
-            # age-based filter eventually excludes it.
+        except OSError:
             pass
 
-    shutil.rmtree(path, onexc=_on_error)
+    shutil.rmtree(root, onexc=_on_error)
+    return not root.exists()
 
 
 def _basic_auth(token: str) -> str:

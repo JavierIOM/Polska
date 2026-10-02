@@ -381,9 +381,18 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
    docker compose exec --user polska scheduler python -m polska.cli tick
    ```
    Omit the company slug to tick every active company, or pass one
-   (`python -m polska.cli tick carscratch`) to run just it. This is the exact same
-   `run_company_tick` call the scheduler makes on its own interval, run once, now,
-   and it prints the same summary line `scripts/observe_ticks.py` does.
+   (`python -m polska.cli tick carscratch`) to run just it. Since 0.8.3 this calls
+   `run_tick_cycle`, the same function the scheduler's job calls (before that it was
+   a separate copy that could drift). It prints one line per company, including the
+   planner's own run status (`planner=succeeded`, `invalid_output`, ...), so a planner
+   whose output was rejected no longer looks like a quiet `proposed=0`, and it exits 1
+   if any company failed or any planner run did not succeed.
+
+   **One difference is not closed yet:** the scheduler's own process is started by the
+   entrypoint under `--no-new-privs`, and from that state it cannot launch the agent
+   wrapper (`setpriv: setresuid failed: Operation not permitted`, checked live on
+   2 Oct 2026). A tick run through `exec --user polska` is not under that restriction,
+   so it can work where the scheduled one does not. See CHANGELOG 0.8.3, "Known issues".
 
    `--user polska` matters here specifically because `exec` (unlike `run`) attaches
    to the already-running container directly rather than going through its

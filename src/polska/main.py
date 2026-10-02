@@ -23,14 +23,11 @@ from apscheduler.triggers.interval import IntervalTrigger
 from polska.adapters.registry import AdapterRegistry
 from polska.budget import BudgetGuard
 from polska.config.appconfig import AppConfig, load_app_config
-from polska.config.company import discover_profiles, load_company_profile
 from polska.config.settings import load_settings
 from polska.db.base import make_engine, make_session_factory
 from polska.db.schema_check import assert_schema_is_current
-from polska.orchestrator import run_company_tick, run_startup_recovery
+from polska.orchestrator import run_startup_recovery, run_tick_cycle
 from polska.runner import AgentRunner
-from polska.sync import reconcile_removed_companies
-from polska.workspace import reclaim_node_modules_for_terminal_tasks
 
 logger = logging.getLogger("polska.main")
 
@@ -42,55 +39,9 @@ async def _tick_all_companies(
     companies_dir: Path,
     workspace_root: Path,
 ) -> None:
-    """Fired on every scheduler interval. Reloads profiles from disk each time, so
-    an edited or newly added company YAML is picked up without a restart."""
-    with session_factory() as session:
-        abandoned = reconcile_removed_companies(session, companies_dir)
-        reclaimed = reclaim_node_modules_for_terminal_tasks(
-            session,
-            workspace_root,
-            grace_period=dt.timedelta(hours=app_config.limits.workspace_node_modules_grace_hours),
-        )
-    if abandoned:
-        logger.warning(
-            "Reconciled %d task(s) whose company's profile is no longer loaded.", abandoned
-        )
-    if reclaimed:
-        logger.info(
-            "Reclaimed node_modules for %d workspace(s) past their grace period.", reclaimed
-        )
-
-    for path in discover_profiles(companies_dir):
-        try:
-            loaded = load_company_profile(path)
-        except Exception:
-            # A malformed profile must not take every other company's tick down
-            # with it.
-            logger.exception("Failed to load company profile %s; skipped this tick.", path)
-            continue
-
-        try:
-            summary = await run_company_tick(
-                session_factory, app_config, runner, loaded, workspace_root
-            )
-        except Exception:
-            # One company's fatal error (e.g. the CLI itself being unreachable,
-            # which run_company_tick deliberately re-raises) must not stop the
-            # scheduler from at least trying the rest.
-            logger.exception(
-                "Tick for %s raised; other companies still ran this cycle.", loaded.profile.slug
-            )
-            continue
-
-        logger.info(
-            "%s: proposed=%d enqueued=%d deduped_out=%d requeued=%d dispatched=%d",
-            loaded.profile.slug,
-            summary.proposed,
-            summary.enqueued,
-            summary.deduped_out,
-            summary.requeued,
-            summary.dispatched,
-        )
+    """Fired on every scheduler interval. The work itself lives in
+    :func:`polska.orchestrator.run_tick_cycle`, shared with ``polska-cli tick``."""
+    await run_tick_cycle(session_factory, app_config, runner, companies_dir, workspace_root)
 
 
 async def main() -> None:

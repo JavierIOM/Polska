@@ -118,6 +118,10 @@ RUN REAL_CLI=$(find / -path /proc -prune -o -type f -name claude -path '*/_bundl
 
 COPY migrations/ ./migrations/
 COPY alembic.ini ./
+# The verify_*.sh scripts are run inside the container (README, wiki), so they
+# have to be in the image; before this they were on the host only and every
+# documented `docker compose exec ... sh scripts/...` failed with "No such file".
+COPY scripts/ ./scripts/
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

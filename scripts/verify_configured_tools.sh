@@ -3,8 +3,10 @@
 # real `claude` CLI process during a live tick and prints its actual
 # command-line flags, straight from /proc, rather than trusting anything
 # this project's own code claims about what it passed. Run this while a
-# tick is in progress (or trigger one with `polska-cli tick <slug>` in
-# another shell), as root so it can read another uid's /proc/<pid>/cmdline:
+# tick is in progress (trigger one in another shell with
+# `docker compose exec --user polska scheduler python -m polska.cli tick <slug>`;
+# plain `exec` runs as root, which is not how the scheduler runs), as root so it
+# can read another uid's /proc/<pid>/cmdline:
 #
 #   docker compose exec --user root scheduler sh scripts/verify_configured_tools.sh
 #
@@ -41,5 +43,5 @@ while [ "$i" -lt 60 ]; do
 done
 
 echo "FAIL: no claude CLI process (uid 1001) seen in 60s." >&2
-echo "Trigger a tick in another shell first: docker compose exec scheduler polska-cli tick <slug>" >&2
+echo "Trigger a tick in another shell first: docker compose exec --user polska scheduler python -m polska.cli tick <slug>" >&2
 exit 1

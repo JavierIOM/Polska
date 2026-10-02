@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -27,7 +28,12 @@ from sqlalchemy.orm import Session, selectinload, sessionmaker
 from polska.activity import log
 from polska.budget import reconcile_orphaned_runs
 from polska.config.appconfig import AppConfig, LimitsConfig
-from polska.config.company import CompanyProfile, LoadedProfile
+from polska.config.company import (
+    CompanyProfile,
+    LoadedProfile,
+    discover_profiles,
+    load_company_profile,
+)
 from polska.db.enums import ActivityKind, AgentName, GoalStatus, RunStatus, TaskState, TaskType
 from polska.db.models import Goal, Run, Task
 from polska.db.state import ACTIVE_STATES
@@ -35,8 +41,12 @@ from polska.db.types import utcday, utcnow
 from polska.dedup import deduplicate
 from polska.runner import AgentRunner
 from polska.schemas.planner import PlannerOutput, ProposedTask
-from polska.sync import sync_company
-from polska.workspace import WorkspaceError, prepare_task_workspace
+from polska.sync import reconcile_removed_companies, sync_company
+from polska.workspace import (
+    WorkspaceError,
+    prepare_task_workspace,
+    reclaim_node_modules_for_terminal_tasks,
+)
 
 logger = logging.getLogger("polska.orchestrator")
 
@@ -68,6 +78,8 @@ class TickSummary:
     __slots__ = (
         "company_id",
         "skipped_inactive",
+        "planner_status",
+        "planner_error",
         "proposed",
         "deduped_out",
         "skipped_daily_cap",
@@ -79,6 +91,10 @@ class TickSummary:
     def __init__(self, company_id: int) -> None:
         self.company_id = company_id
         self.skipped_inactive = False
+        #: How the planner's own run ended. Without this, "proposed=0" cannot tell a
+        #: planner that chose to do nothing from one whose output was rejected.
+        self.planner_status: RunStatus | None = None
+        self.planner_error: str | None = None
         self.proposed = 0
         self.deduped_out = 0
         self.skipped_daily_cap = 0
@@ -292,6 +308,8 @@ async def run_company_tick(
             session, company_id=company.id, company_profile=profile, user_prompt=planner_prompt
         )
         plan = plan_outcome.output
+        summary.planner_status = plan_outcome.run.status
+        summary.planner_error = plan_outcome.run.error
 
         if isinstance(plan, PlannerOutput):
             if plan.is_empty:
@@ -364,6 +382,140 @@ async def run_company_tick(
             raise fatal
 
     return summary
+
+
+class UnknownCompanyError(LookupError):
+    """A cycle was asked for one company by slug and no profile has that name."""
+
+
+@dataclass
+class CycleResult:
+    #: Slug to what its tick did, for every company whose tick completed.
+    summaries: dict[str, TickSummary] = field(default_factory=dict)
+    #: Companies whose profile would not load or whose tick raised.
+    failed: list[str] = field(default_factory=list)
+
+    @property
+    def planner_problems(self) -> list[str]:
+        """Slugs whose planner run did not succeed."""
+        return [
+            slug
+            for slug, summary in self.summaries.items()
+            if summary.planner_status not in (None, RunStatus.SUCCEEDED)
+        ]
+
+
+def _reconcile_removed(session_factory: sessionmaker[Session], companies_dir: Path) -> None:
+    try:
+        with session_factory() as session:
+            abandoned = reconcile_removed_companies(session, companies_dir)
+    except Exception:
+        # Housekeeping must never be what stops a company from being planned for.
+        logger.exception("Reconciling removed companies failed; continuing with the tick.")
+        return
+    if abandoned:
+        logger.warning(
+            "Reconciled %d task(s) whose company's profile is no longer loaded.", abandoned
+        )
+
+
+def _reclaim_node_modules(
+    session_factory: sessionmaker[Session], app_config: AppConfig, workspace_root: Path
+) -> None:
+    try:
+        with session_factory() as session:
+            reclaimed = reclaim_node_modules_for_terminal_tasks(
+                session,
+                workspace_root,
+                grace_period=dt.timedelta(
+                    hours=app_config.limits.workspace_node_modules_grace_hours
+                ),
+            )
+    except Exception:
+        logger.exception("Reclaiming node_modules failed; the tick itself already ran.")
+        return
+    if reclaimed:
+        logger.info(
+            "Reclaimed node_modules for %d workspace(s) past their grace period.", reclaimed
+        )
+
+
+async def run_tick_cycle(
+    session_factory: sessionmaker[Session],
+    app_config: AppConfig,
+    runner: AgentRunner,
+    companies_dir: Path,
+    workspace_root: Path,
+    *,
+    only_slug: str | None = None,
+) -> CycleResult:
+    """Everything one firing of the schedule does, for every company (or just
+    ``only_slug``). The scheduler job and ``polska-cli tick`` both call this, so
+    a manual tick exercises the same code as the scheduled one.
+
+    Profiles are reloaded from disk every time, so an edited or newly added company
+    YAML is picked up without a restart. Housekeeping brackets the company ticks
+    and is isolated from them: reconcile first (so a removed company's tasks are not
+    dispatched), reclaim last, and a failure in either is logged and skipped.
+    Before this, an exception in cleanup ran ahead of every company and cancelled the
+    whole day's planning.
+
+    Raises :class:`UnknownCompanyError` before doing anything else if ``only_slug``
+    matches no profile.
+    """
+    paths = list(discover_profiles(companies_dir))
+    if only_slug is not None:
+        paths = [p for p in paths if p.stem == only_slug]
+        if not paths:
+            raise UnknownCompanyError(only_slug)
+
+    _reconcile_removed(session_factory, companies_dir)
+
+    result = CycleResult()
+    for path in paths:
+        try:
+            loaded = load_company_profile(path)
+        except Exception:
+            # A malformed profile must not take every other company's tick down
+            # with it.
+            logger.exception("Failed to load company profile %s; skipped this tick.", path)
+            result.failed.append(path.stem)
+            continue
+
+        slug = loaded.profile.slug
+        try:
+            summary = await run_company_tick(
+                session_factory, app_config, runner, loaded, workspace_root
+            )
+        except Exception:
+            # One company's fatal error (e.g. the CLI itself being unreachable,
+            # which run_company_tick deliberately re-raises) must not stop the
+            # scheduler from at least trying the rest.
+            logger.exception("Tick for %s raised; other companies still ran this cycle.", slug)
+            result.failed.append(slug)
+            continue
+
+        result.summaries[slug] = summary
+        logger.info(
+            "%s: planner=%s proposed=%d enqueued=%d deduped_out=%d requeued=%d dispatched=%d",
+            slug,
+            summary.planner_status.value if summary.planner_status else "n/a",
+            summary.proposed,
+            summary.enqueued,
+            summary.deduped_out,
+            summary.requeued,
+            summary.dispatched,
+        )
+        if summary.planner_status not in (None, RunStatus.SUCCEEDED):
+            logger.warning(
+                "%s: the planner run ended %s, so this cycle planned nothing: %s",
+                slug,
+                summary.planner_status.value,
+                (summary.planner_error or "no error recorded")[:300],
+            )
+
+    _reclaim_node_modules(session_factory, app_config, workspace_root)
+    return result
 
 
 def _flatten_sub_units(

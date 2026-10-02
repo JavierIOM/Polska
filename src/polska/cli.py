@@ -12,23 +12,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import datetime as dt
 import getpass
+import logging
 import secrets
 import sys
 
 from polska.adapters.registry import AdapterRegistry
 from polska.budget import BudgetGuard
 from polska.config.appconfig import load_app_config
-from polska.config.company import discover_profiles, load_company_profile
 from polska.config.settings import load_settings
 from polska.dashboard.security import hash_password
 from polska.db.base import make_engine, make_session_factory
+from polska.db.enums import RunStatus
 from polska.db.schema_check import assert_schema_is_current
-from polska.orchestrator import run_company_tick, run_startup_recovery
+from polska.orchestrator import UnknownCompanyError, run_startup_recovery, run_tick_cycle
 from polska.runner import AgentRunner
-from polska.sync import reconcile_removed_companies
-from polska.workspace import reclaim_node_modules_for_terminal_tasks
 
 
 def _init_auth() -> None:
@@ -77,27 +75,17 @@ def _init_auth() -> None:
 
 async def _tick(slug: str | None) -> None:
     """Run exactly one planning/dispatch cycle now, for one company or all of
-    them, then exit. The same call the scheduler itself makes on its own
-    interval; this is the manual override for "not 24 hours from now"."""
+    them, then exit. The same function the scheduler calls on its own interval
+    (``run_tick_cycle``); this is the manual override for "not 24 hours from now".
+    Exits 1 if any company failed or any planner run did not succeed."""
     settings = load_settings()
+    logging.basicConfig(level=settings.log_level)
     app_config = load_app_config(settings.config_path)
     engine = make_engine(settings.database_url, echo=settings.sql_echo)
     assert_schema_is_current(engine)
     session_factory = make_session_factory(engine)
 
     run_startup_recovery(session_factory, app_config)
-
-    with session_factory() as session:
-        abandoned = reconcile_removed_companies(session, settings.companies_dir)
-        reclaimed = reclaim_node_modules_for_terminal_tasks(
-            session,
-            settings.workspace_root,
-            grace_period=dt.timedelta(hours=app_config.limits.workspace_node_modules_grace_hours),
-        )
-    if abandoned:
-        print(f"Reconciled {abandoned} task(s) whose company's profile is no longer loaded.")
-    if reclaimed:
-        print(f"Reclaimed node_modules for {reclaimed} workspace(s) past their grace period.")
 
     registry = AdapterRegistry()
     guard = BudgetGuard(app_config)
@@ -108,25 +96,31 @@ async def _tick(slug: str | None) -> None:
         agent_cli_path=settings.resolved_agent_cli_wrapper_path(),
     )
 
-    paths = list(discover_profiles(settings.companies_dir))
-    if slug:
-        paths = [p for p in paths if p.stem == slug]
-        if not paths:
-            print(
-                f"No company profile named {slug!r} in {settings.companies_dir}.", file=sys.stderr
-            )
-            raise SystemExit(1)
+    try:
+        result = await run_tick_cycle(
+            session_factory,
+            app_config,
+            runner,
+            settings.companies_dir,
+            settings.workspace_root,
+            only_slug=slug,
+        )
+    except UnknownCompanyError:
+        print(f"No company profile named {slug!r} in {settings.companies_dir}.", file=sys.stderr)
+        raise SystemExit(1) from None
 
-    for path in paths:
-        loaded = load_company_profile(path)
-        summary = await run_company_tick(
-            session_factory, app_config, runner, loaded, settings.workspace_root
-        )
+    for company, summary in result.summaries.items():
+        status = summary.planner_status.value if summary.planner_status else "n/a"
         print(
-            f"{loaded.profile.slug}: proposed={summary.proposed} enqueued={summary.enqueued} "
-            f"deduped_out={summary.deduped_out} requeued={summary.requeued} "
-            f"dispatched={summary.dispatched}"
+            f"{company}: planner={status} proposed={summary.proposed} "
+            f"enqueued={summary.enqueued} deduped_out={summary.deduped_out} "
+            f"requeued={summary.requeued} dispatched={summary.dispatched}"
         )
+        if summary.planner_status not in (None, RunStatus.SUCCEEDED):
+            print(f"  planner error: {(summary.planner_error or '')[:400]}", file=sys.stderr)
+
+    if result.failed or result.planner_problems:
+        raise SystemExit(1)
 
 
 def main() -> None:
