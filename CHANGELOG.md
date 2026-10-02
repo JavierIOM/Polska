@@ -5,6 +5,29 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-10-02
+
+Found by running 0.8.4's fix against the real stuck task-24 workspace as the scheduler
+user, before deploying it: a second bug in the same v0.7.0 `work/` code.
+
+### Fixed
+
+- `work/node_modules` was a dangling symlink in production. A symlink target is
+  resolved against the link's own directory, and production's workspace root is the
+  relative `data/workspaces`, so the relative target pointed at a path that does not
+  exist and the engineer's writable copy had no `node_modules` at all. The target is
+  now absolute. pytest's `tmp_path` is absolute, so no test could have seen it; the
+  new one runs from a relative root.
+- The mode-fixing walk over `work/` no longer chmods symlinks (it raised on the
+  dangling one).
+
+### Verified live
+
+- `_ensure_writable_copy` against task 24's real workspace as uid 1000: the broken
+  partial `work/` was removed, rebuilt and marked ready, `node_modules` resolves
+  (625 packages) and `repo/` is still read-only. Run from a copy of the patched file
+  before the image was rebuilt.
+
 ## [0.8.4] - 2026-10-02
 
 Found by the first live tick run as the scheduler user (`exec --user polska`), after

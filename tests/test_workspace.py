@@ -984,3 +984,32 @@ def test_the_writable_copy_is_writable_before_node_modules_is_linked_into_it(
     assert seen["parent_mode"] & stat.S_IWUSR, (
         "work/ was still read-only when node_modules was linked"
     )
+
+
+def test_the_node_modules_link_survives_a_relative_workspace_root(tmp_path, monkeypatch) -> None:
+    """Production's workspace root is the relative ``data/workspaces``. A symlink target
+    is resolved against the link's own directory, not the cwd, so a relative target
+    dangled and work/ had no node_modules at all (found live, 2 Oct 2026). pytest's
+    tmp_path is absolute, which is why nothing caught it."""
+    import polska.workspace as workspace_module
+
+    probe = tmp_path / "probe"
+    try:
+        probe.symlink_to(tmp_path, target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform or user cannot create symlinks")
+    probe.unlink()
+
+    monkeypatch.chdir(tmp_path)
+    task_workspace = Path("data/workspaces/7")
+    repo_dir = task_workspace / "repo"
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "a.ts").write_text("export {}\n", encoding="utf-8")
+    (repo_dir / "node_modules" / "pkg").mkdir(parents=True)
+
+    workspace_module._ensure_writable_copy(task_workspace, repo_dir, task_id=7)
+
+    link = task_workspace / "work" / "node_modules"
+    assert link.is_symlink()
+    assert link.exists(), "the link dangles: it points at a path relative to the wrong directory"
+    assert link.resolve() == (repo_dir / "node_modules").resolve()

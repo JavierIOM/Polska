@@ -533,7 +533,12 @@ def _ensure_writable_copy(task_workspace: Path, repo_dir: Path, task_id: int) ->
 
     node_modules_source = repo_dir / "node_modules"
     if node_modules_source.exists():
-        (work_dir / "node_modules").symlink_to(node_modules_source, target_is_directory=True)
+        # Absolute: a symlink target is resolved against the link's own directory, and
+        # production's workspace root is the relative data/workspaces, so a relative
+        # target dangled (found live, 2 Oct 2026).
+        (work_dir / "node_modules").symlink_to(
+            node_modules_source.resolve(), target_is_directory=True
+        )
 
     for root, dirs, files in os.walk(work_dir):
         if "node_modules" in dirs:
@@ -541,7 +546,9 @@ def _ensure_writable_copy(task_workspace: Path, repo_dir: Path, task_id: int) ->
         for name in dirs:
             (Path(root) / name).chmod(0o777)
         for name in files:
-            (Path(root) / name).chmod(0o666)
+            path = Path(root) / name
+            if not path.is_symlink():
+                path.chmod(0o666)
 
     marker.write_text("ready\n", encoding="utf-8")
 
