@@ -521,16 +521,20 @@ def _ensure_writable_copy(task_workspace: Path, repo_dir: Path, task_id: int) ->
 
     shutil.copytree(repo_dir, work_dir, ignore=shutil.ignore_patterns("node_modules"))
 
-    node_modules_source = repo_dir / "node_modules"
-    if node_modules_source.exists():
-        (work_dir / "node_modules").symlink_to(node_modules_source, target_is_directory=True)
-
     # copytree preserves the source's own mode bits, which for a repo_dir
     # already locked read-only (see _make_read_only) means no write bit for
     # "other" at all -- exactly the thing this directory exists not to be.
     # Same world-writable simplification as node_modules gets, for the same
-    # reason: this is the agent's own scratch copy, never a secret.
+    # reason: this is the agent's own scratch copy, never a secret. Done before
+    # the symlink below, which is created inside work_dir: root ignores a
+    # read-only parent, every other user gets PermissionError (found live, 2 Oct
+    # 2026, the first time this ran as anyone but root).
     work_dir.chmod(0o777)
+
+    node_modules_source = repo_dir / "node_modules"
+    if node_modules_source.exists():
+        (work_dir / "node_modules").symlink_to(node_modules_source, target_is_directory=True)
+
     for root, dirs, files in os.walk(work_dir):
         if "node_modules" in dirs:
             dirs.remove("node_modules")  # a symlink, not a real tree to chmod

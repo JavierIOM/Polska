@@ -954,3 +954,33 @@ def test_a_partial_work_copy_that_will_not_delete_fails_loudly(tmp_path, monkeyp
 
     with pytest.raises(WorkspaceError, match=r"partial work/"):
         workspace_module._ensure_writable_copy(task_workspace, repo_dir, task_id=7)
+
+
+def test_the_writable_copy_is_writable_before_node_modules_is_linked_into_it(
+    tmp_path, monkeypatch
+) -> None:
+    """2 Oct 2026, first time work/ ever ran as anyone but root: copytree copies the
+    locked read-only repo's mode onto work/, and the symlink for node_modules was
+    created inside it before the chmod that makes it writable. Root ignores that;
+    every other user gets PermissionError."""
+    import polska.workspace as workspace_module
+
+    task_workspace = tmp_path / "7"
+    repo_dir = task_workspace / "repo"
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "a.ts").write_text("export {}\n", encoding="utf-8")
+    (repo_dir / "node_modules").mkdir()
+    workspace_module._make_read_only(repo_dir)
+
+    seen: dict[str, int] = {}
+
+    def record_symlink(self, target, target_is_directory=False):
+        seen["parent_mode"] = stat.S_IMODE(self.parent.stat().st_mode)
+
+    monkeypatch.setattr(Path, "symlink_to", record_symlink)
+
+    workspace_module._ensure_writable_copy(task_workspace, repo_dir, task_id=7)
+
+    assert seen["parent_mode"] & stat.S_IWUSR, (
+        "work/ was still read-only when node_modules was linked"
+    )

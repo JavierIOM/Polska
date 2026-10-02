@@ -721,7 +721,12 @@ async def _dispatch_one(
                     task.id,
                     needs_writable_copy=task.type is TaskType.ENGINEERING,
                 )
-            except WorkspaceError as exc:
+            except (WorkspaceError, OSError) as exc:
+                # OSError too: a filesystem problem preparing this one task's
+                # workspace is this task's failure, counted toward abandonment, not
+                # a reason to leave it queued to fail identically on every tick and
+                # take the whole company's tick down with it (found live, 2 Oct 2026).
+                #
                 # The task never reached the agent, but it was still a real
                 # attempt (a broken repo slug, a dead token, a network outage),
                 # and it must count as one: transition through running first so

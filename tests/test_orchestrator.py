@@ -642,3 +642,53 @@ def test_startup_recovery_is_silent_with_nothing_to_recover(
     with caplog.at_level("WARNING", logger="polska.orchestrator"):
         run_startup_recovery(session_factory, app_config)
     assert caplog.records == []
+
+
+async def test_a_workspace_os_error_fails_the_task_instead_of_poisoning_every_tick(
+    session_factory, company, monkeypatch, tmp_path
+) -> None:
+    """2 Oct 2026: preparing an engineer's work/ raised PermissionError, not
+    WorkspaceError. It escaped, left the task queued with no attempt counted, and so
+    failed identically on every tick while taking the whole company's tick down."""
+    from polska.config.company import CompanyProfile
+    from polska.db.enums import TaskType
+    from polska.db.models import Task
+    from polska.orchestrator import _dispatch_one
+
+    with session_factory() as session:
+        task = Task(
+            company_id=company.id,
+            type=TaskType.ENGINEERING,
+            title="Implement the single check",
+            description="x",
+            rationale="x",
+        )
+        session.add(task)
+        session.commit()
+        task_id = task.id
+
+    class StubRunner:
+        def __init__(self) -> None:
+            self.failed: list[tuple[int, str]] = []
+            self.ran = False
+
+        def fail_or_abandon(self, session, task, reason, **kwargs) -> None:
+            self.failed.append((task.id, reason))
+
+        async def run_worker(self, *args, **kwargs) -> None:
+            self.ran = True
+
+    def boom(*args, **kwargs):
+        raise PermissionError(13, "Permission denied", "data/workspaces/24/work/node_modules")
+
+    monkeypatch.setattr("polska.orchestrator.prepare_task_workspace", boom)
+    profile = CompanyProfile.model_validate(
+        {"slug": "test-co", "name": "Test Co", "idea": "x", "goals": []}
+    )
+    runner = StubRunner()
+
+    await _dispatch_one(session_factory, runner, profile, tmp_path, task_id)
+
+    assert runner.ran is False
+    assert [failed_id for failed_id, _ in runner.failed] == [task_id]
+    assert "Permission denied" in runner.failed[0][1]

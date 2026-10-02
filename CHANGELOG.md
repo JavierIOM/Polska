@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] - 2026-10-02
+
+Found by the first live tick run as the scheduler user (`exec --user polska`), after
+0.8.3 deployed: the planner succeeded and enqueued two tasks, the analyst task ran to
+completion, and the engineering task died preparing its workspace.
+
+### Fixed
+
+- The engineer's `work/` copy could never be created by a non-root user. `copytree`
+  copies the locked read-only repo's mode onto `work/` (0555), and the `node_modules`
+  symlink was created inside it before the chmod that makes it writable. Root ignores a
+  read-only parent, so every earlier manual tick passed; this was the first time the
+  v0.7.0 code ran as anyone else. The chmod now comes first.
+- A filesystem error preparing one task's workspace (`OSError`, not just
+  `WorkspaceError`) now fails that task and counts an attempt. It used to escape,
+  leave the task `queued` with no attempt counted, fail identically on every tick and
+  take the whole company's tick down with it.
+
+### Verified live
+
+- Analyst process launched with `--tools Read,Glob,Grep,WebSearch,WebFetch
+  --allowedTools Read,Glob,Grep,WebSearch,WebFetch --max-turns 25 --max-budget-usd 1.0
+  --model claude-sonnet-5` (read from `/proc` by `scripts/verify_configured_tools.sh`),
+  matching `config/default.yaml`. Analyst task 25 completed: $0.24, 23 tool calls.
+  The engineer's flags are not yet observed.
+
 ## [0.8.3] - 2026-10-02
 
 Follow-up to a full review of the repo after the scheduled ticks on 1 and 2 Oct
