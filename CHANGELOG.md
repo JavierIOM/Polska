@@ -5,6 +5,22 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-10-02
+
+The `reclaim_node_modules_for_terminal_tasks` cleanup crashed on every tick
+when trying to delete node_modules owned by a different UID (agent uid 1001,
+scheduler uid 1000). Files created by the agent during a run are owned by
+1001; the scheduler running as 1000 cannot chmod them, so `_force_rmtree`'s
+error handler would crash trying. Silenced on permission errors: cleanup is
+best-effort for old artifacts and a stray file from a past run does not block
+future work.
+
+### Fixed
+
+- `_force_rmtree` in `workspace.py` wraps the chmod in try/except and skips
+  files it cannot delete rather than crashing. Scheduled cleanup that fails
+  for one file now continues with the rest.
+
 ## [0.8.1] - 2026-09-30
 
 `runner.py` had, since phase 2 (24 Sep), only ever set `allowed_tools`

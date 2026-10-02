@@ -571,8 +571,17 @@ def _force_rmtree(path: Path) -> None:
     """
 
     def _on_error(func, target_path, exc_info):  # noqa: ANN001 - shutil's onexc signature
-        os.chmod(target_path, stat.S_IWRITE)
-        func(target_path)
+        try:
+            os.chmod(target_path, stat.S_IWRITE)
+            func(target_path)
+        except (PermissionError, OSError):
+            # File is owned by a different UID (e.g., agent UID 1001, scheduler UID 1000),
+            # and we can't change its permissions or delete it. Skip it: cleanup of old
+            # artifacts is best-effort, and a stray file from a past run does not block
+            # future work. A subsequent cleanup attempt (next 24h) may succeed if the file
+            # gets touched in a way that changes its ownership or permissions, or if the
+            # age-based filter eventually excludes it.
+            pass
 
     shutil.rmtree(path, onexc=_on_error)
 
