@@ -1013,3 +1013,46 @@ def test_the_node_modules_link_survives_a_relative_workspace_root(tmp_path, monk
     assert link.is_symlink()
     assert link.exists(), "the link dangles: it points at a path relative to the wrong directory"
     assert link.resolve() == (repo_dir / "node_modules").resolve()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX execute bits")
+def test_opening_up_node_modules_keeps_execute_bits(tmp_path: Path) -> None:
+    """The old chmod(0o666) on every file stripped +x too: native binaries such as
+    esbuild could not run, which cost the engineer's first live run seven turns."""
+    import polska.workspace as workspace_module
+
+    node_modules = tmp_path / "node_modules"
+    (node_modules / "esbuild" / "bin").mkdir(parents=True)
+    binary = node_modules / "esbuild" / "bin" / "esbuild"
+    binary.write_bytes(b"\x7fELF")
+    binary.chmod(0o755)
+    plain = node_modules / "esbuild" / "package.json"
+    plain.write_text("{}", encoding="utf-8")
+    plain.chmod(0o644)
+    (node_modules / ".bin").mkdir()
+    (node_modules / ".bin" / "esbuild").symlink_to(binary)
+
+    workspace_module._open_up_vendored_tree(node_modules)
+
+    assert stat.S_IMODE(binary.stat().st_mode) == 0o777
+    assert stat.S_IMODE(plain.stat().st_mode) == 0o666
+    assert stat.S_IMODE(node_modules.stat().st_mode) == 0o777
+
+
+def test_opening_up_node_modules_does_not_chmod_through_a_symlink(tmp_path: Path) -> None:
+    import polska.workspace as workspace_module
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not ours", encoding="utf-8")
+    outside.chmod(0o600)
+    node_modules = tmp_path / "node_modules"
+    node_modules.mkdir()
+    try:
+        (node_modules / "escape").symlink_to(outside)
+    except OSError:
+        pytest.skip("this platform or user cannot create symlinks")
+    before = stat.S_IMODE(outside.stat().st_mode)
+
+    workspace_module._open_up_vendored_tree(node_modules)
+
+    assert stat.S_IMODE(outside.stat().st_mode) == before

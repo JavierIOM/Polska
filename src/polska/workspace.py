@@ -457,12 +457,30 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
     # different UID (see runner.py) with no group relationship to this one
     # worth setting up just to avoid it. The marker file just written above
     # is caught by this same loop, since it lives inside node_modules too.
+    _open_up_vendored_tree(node_modules)
+
+
+def _open_up_vendored_tree(node_modules: Path) -> None:
+    """Make every directory and file under ``node_modules`` writable by anyone,
+    adding permission bits rather than replacing the mode.
+
+    The earlier ``chmod(0o666)`` on every file also stripped the execute bit, so no
+    native binary or script in the tree could run: 0 of 27,824 files had ``+x``, and
+    the engineer's first live run lost seven turns (about a third of its token
+    budget) to ``npx vitest`` failing and then hand-copying esbuild to ``/tmp`` to
+    chmod it itself. Symlinks are skipped: ``chmod`` follows them, and their targets
+    are visited in their own right (or sit outside the tree and are not ours to touch).
+    """
     node_modules.chmod(0o777)
     for root, dirs, files in os.walk(node_modules):
         for name in dirs:
-            (Path(root) / name).chmod(0o777)
+            path = Path(root) / name
+            if not path.is_symlink():
+                path.chmod(0o777)
         for name in files:
-            (Path(root) / name).chmod(0o666)
+            path = Path(root) / name
+            if not path.is_symlink():
+                path.chmod(stat.S_IMODE(path.stat().st_mode) | 0o666)
 
 
 #: Written into work/ only once the copy has genuinely finished. Same

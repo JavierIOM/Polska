@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.9] - 2026-10-07
+
+Found by the first full tick through the new cron line (19:13 UTC, 4m12s, exit 0, $0.92):
+planner, dedup judge and engineer all launched with the flags in `config/default.yaml`,
+and the engineer did real work for the first time since the v0.6 to v0.8 fixes. It
+found the plan, took a baseline (10/10 tests), wrote the check and its tests, and passed
+cycle 1 before being cut off at 767,892 tokens against the 750,000 ceiling (22 turns,
+$0.86 of its $2.00; 89% of the tokens were cache reads). Task 24 was abandoned for it.
+
+### Fixed
+
+- `node_modules` had no execute bits at all (0 of 27,824 files): the vendoring step ran
+  `chmod(0o666)` on every file to make the tree writable, which also stripped `+x`. No
+  native binary or script in it could run, so the engineer lost seven turns (about a third
+  of the run) to `npx vitest` failing and then copying esbuild to `/tmp` to chmod it
+  itself. The permissions are now added, not replaced (`_open_up_vendored_tree`), and
+  symlinks are no longer chmod'd through. Only workspaces vendored from now on benefit;
+  existing ones keep the marker and are not redone.
+
+### Not changed (a decision, and a standing instruction not to raise ceilings)
+
+- The engineer's `max_tokens_per_run` (750,000) counts cache reads at face value, so it
+  caps turns times context size rather than spend: at about 31k tokens a turn it is
+  reached at turn 22, below the `max_turns` of 40, while the dollar ceiling ($2.00) is
+  less than half used. Every engineer run is likely to hit it however well it behaves.
+
 ## [0.8.8] - 2026-10-07
 
 Scheduled ticks have not worked since the entrypoint gained `--no-new-privs` (0.5.0): the
