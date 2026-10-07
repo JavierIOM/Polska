@@ -5,6 +5,29 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.8] - 2026-10-07
+
+Scheduled ticks have not worked since the entrypoint gained `--no-new-privs` (0.5.0): the
+in-container job cannot launch an agent, and 3 to 6 Oct every daily tick died at launch.
+This release makes ticks happen through the path that does work, without changing any
+security boundary.
+
+### Changed
+
+- `scheduler.enabled` is now `false` in `config/default.yaml`, with the reason and the way
+  back written beside it. The in-container job could only fail at launch.
+- Ticks run from the droplet's cron (`30 7 * * *`, as `javier`, under `flock`) through
+  `docker compose exec --user polska scheduler python -m polska.cli tick`, output to
+  `~/polska-tick.log`. README "Scheduled ticks" documents it, including that the cron
+  entry must be removed when `scheduler.enabled` goes back to `true`.
+
+### Not fixed
+
+- The privilege model itself: the in-container scheduler still cannot launch agents. A
+  narrow design (a `sudo` rule letting uid 1000 become only uid 1001, with `setpriv`'s file
+  capability removed so uid 1000 cannot reach root) is proposed in wiki `polska.md`, not
+  built, because it changes the agent sandbox and needs a decision.
+
 ## [0.8.7] - 2026-10-07
 
 Found by running 0.8.6 under the real failure (a tick as uid 1000 with `--no-new-privs`)

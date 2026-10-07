@@ -5,7 +5,14 @@
 # rather than at 3am on the fourth tick.
 
 scheduler:
-  enabled: true
+  # False since 7 Oct 2026. The in-container job cannot launch agents: the entrypoint
+  # starts this process under --no-new-privs, which blocks the agent wrapper's uid switch
+  # (setpriv: setresuid failed, exit 127), so every scheduled tick died at launch. The
+  # droplet's cron runs `polska.cli tick` through `docker compose exec --user polska`
+  # instead, which is not under that restriction. Set this back to true when the privilege
+  # model is fixed (CHANGELOG 0.8.3 "Known issues", wiki polska.md), and remove the cron
+  # entry (`crontab -e` as javier) in the same change, or the two will both tick.
+  enabled: false
   # Daily. How often the business actually changes is the question that decides
   # this, not the per-tick cost: measured, an idle tick and a working one are both
   # cheap enough that the interval was never a budget decision.

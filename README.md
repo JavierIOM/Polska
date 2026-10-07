@@ -371,10 +371,12 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
    docker compose up -d
    docker compose logs -f
    ```
-   The dashboard is now on `http://<droplet-ip>:8000/login`. The scheduler is running
-   but, per `scheduler.run_on_start: false` and `IntervalTrigger`'s own default
-   (`now + interval_hours`, computed fresh on every process start), it will not tick
-   on its own until a full `interval_hours` has passed.
+   The dashboard is now on `http://<droplet-ip>:8000/login`. The scheduler container
+   is running, but since 0.8.8 its own job is switched off (`scheduler.enabled: false`,
+   see "Scheduled ticks" below), so it idles. If it were on, per
+   `scheduler.run_on_start: false` and `IntervalTrigger`'s own default
+   (`now + interval_hours`, computed fresh on every process start), it would not tick
+   on its own until a full `interval_hours` had passed.
 
 7. **Trigger the first tick yourself, on your own schedule, not the container's:**
    ```
@@ -400,6 +402,22 @@ inside the image), not run end to end on real Ubuntu hardware. Treat the first r
    as root beyond the one entrypoint step that sets up the agent's network
    restriction (see "Running as non-root" below); this flag is what keeps an
    ad-hoc `exec` command the same way.
+
+### Scheduled ticks (host cron, since 0.8.8)
+
+The in-container job cannot launch agents (the `--no-new-privs` difference above), so it
+is off and the droplet's own cron runs the tick instead, as `javier`:
+
+```
+30 7 * * * cd /home/javier/Polska && /usr/bin/flock -n /tmp/polska-tick.lock /usr/bin/docker compose exec -T --user polska scheduler python -m polska.cli tick >> /home/javier/polska-tick.log 2>&1
+```
+
+`crontab -l` shows it; `tail ~/polska-tick.log` shows what each tick did (one line per
+company with `planner=<status>`, exit 1 on any failure). `flock` stops two ticks
+overlapping, which matters because every `polska.cli tick` starts by reconciling any run
+still marked `running`, which it would wrongly treat as orphaned if another tick were in
+flight. When the privilege model is fixed, set `scheduler.enabled: true` in
+`config/default.yaml` and delete the cron entry in the same change, or both will tick.
 
 ### Upgrading a deployment that predates the non-root container user
 
