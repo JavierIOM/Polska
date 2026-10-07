@@ -836,6 +836,36 @@ class AgentRunner:
                 started=started,
             )
             raise
+        except Exception as exc:
+            # Anything else escaping the SDK call. Seen live, 3 to 6 Oct 2026: ProcessError
+            # (exit 127) when the agent wrapper could not switch user. The row was written
+            # as `running` before the call, so without this it stayed `running` until the
+            # next process start, the dashboard showed a run "in progress" for days, and
+            # the activity feed showed nothing had gone wrong. Re-raised, as with the CLI
+            # branch above: the caller still decides what a broken launch means.
+            description = f"{type(exc).__name__}: {exc}"[:2000]
+            self._finalize_run(
+                session,
+                run=run,
+                raw_output=None,
+                tools_called=tools_called,
+                usage=running.as_tuple(self._config, model),
+                status=RunStatus.FAILED,
+                error=description,
+                session_id=None,
+                duration_ms=None,
+                started=started,
+            )
+            log(
+                session,
+                company_id=company_id,
+                kind=ActivityKind.ERROR,
+                summary=f"{agent_name.value} run failed before producing a result",
+                task_id=task.id if task else None,
+                run_id=run.id,
+                error=description,
+            )
+            raise
 
         if status == RunStatus.INTERRUPTED:
             self._write_run_halt(

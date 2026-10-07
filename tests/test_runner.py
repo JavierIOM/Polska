@@ -15,6 +15,7 @@ import pytest
 from claude_agent_sdk import (
     AssistantMessage,
     CLIConnectionError,
+    ProcessError,
     ResultError,
     ResultMessage,
     TextBlock,
@@ -1272,3 +1273,54 @@ async def test_a_valid_planner_reply_is_not_retried(
     )
 
     assert len(query.prompts) == 1
+
+
+# ------------------------------------------- a failed launch must not leave a run "running"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ProcessError(
+            "Command failed with exit code 127", exit_code=127, stderr="setpriv: setresuid failed"
+        ),
+        RuntimeError("something nobody anticipated"),
+    ],
+    ids=["process-error", "unexpected"],
+)
+async def test_an_exception_from_the_sdk_call_closes_the_run_row_instead_of_leaving_it_running(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    exc: Exception,
+) -> None:
+    """3 to 6 Oct 2026: the agent wrapper exited 127 (it could not switch user), the SDK
+    raised ProcessError, and nothing closed the run row written as ``running`` before
+    the call. Four planner rows showed in progress for days, and the activity feed
+    showed nothing had gone wrong."""
+    from polska.db.enums import ActivityKind
+    from polska.db.models.activity import ActivityEvent
+
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query_raising(exc),
+    )
+
+    with pytest.raises(type(exc)):
+        await runner.run_planner(
+            session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
+        )
+
+    rows = session.execute(select(Run)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == RunStatus.FAILED
+    assert rows[0].finished_at is not None
+    assert type(exc).__name__ in rows[0].error
+    errors = session.execute(
+        select(ActivityEvent).where(ActivityEvent.kind == ActivityKind.ERROR)
+    ).scalars()
+    assert [e.run_id for e in errors] == [rows[0].id]

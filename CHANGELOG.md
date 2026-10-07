@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.6] - 2026-10-07
+
+Four planner rows sat in `running` on the dashboard from 3 to 6 Oct, with no tokens and
+no cost. They were never processes. Each was a scheduled tick where the agent wrapper
+exited 127 (`setpriv: setresuid failed`, the scheduler's `--no-new-privs` blocking its own
+uid switch, see 0.8.3 "Known issues"), the SDK raised `ProcessError`, and the runner only
+closed a run row for a few specific exceptions, not that one.
+
+### Fixed
+
+- Any exception escaping the SDK call now closes the run row as `failed` (keeping the
+  usage streamed before it, and the error text) and writes an `error` activity event with
+  the run id, then re-raises as before. Before, the row stayed `running` until the next
+  process start, where the startup reconciler prices it at its worst case, and nothing in
+  the activity feed said anything had gone wrong.
+
+### Not fixed (still the cause of the failing ticks)
+
+- The scheduled job still cannot launch an agent. That needs the privilege-model decision
+  recorded under 0.8.3 "Known issues". This release only stops it leaving stuck rows
+  behind and makes it visible.
+- A failure that raises out of the planner still stops that company's queued tasks being
+  dispatched in the same tick (task 24 has been `queued` since 2 Oct for this reason).
+- A worker task whose launch raises would be left in `running` (it counts against
+  `max_concurrent_tasks`) because `run_worker` does not catch it. Latent: the planner
+  fails first today, so no worker has been affected.
+
 ## [0.8.5] - 2026-10-02
 
 Found by running 0.8.4's fix against the real stuck task-24 workspace as the scheduler
