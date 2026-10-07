@@ -595,3 +595,52 @@ async def test_the_tick_sweep_settles_a_task_whose_approvals_were_already_execut
 
     assert resolve_waiting_tasks(session) == 1
     assert task.state == TaskState.DONE
+
+
+async def test_the_planner_is_told_a_dry_run_change_was_not_applied(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    """7 Oct 2026: task 26's commit-and-push was approved and executed by the dry-run
+    adapter, so it never reached the repository, yet the planner saw it as done and set
+    task 28 to mirror a change that did not exist."""
+    from polska.budget import BudgetGuard
+    from polska.orchestrator import _build_planner_prompt
+
+    task, (approval,) = await _parked_task(session, app_config, registry, company, "email.send")
+    await execute_approval(
+        session,
+        app_config,
+        registry,
+        decide_approval(session, approval, approved=True, decided_by="javier"),
+    )
+
+    class _Runner:
+        budget_guard = BudgetGuard(app_config)
+
+    prompt = _build_planner_prompt(session, company.id, [], _Runner())
+    line = next(line for line in prompt.splitlines() if task.title in line)
+    assert "NOT APPLIED" in line
+    assert "email.send" in line
+
+
+async def test_a_done_task_with_no_dry_run_actions_reads_as_before(
+    session: Session, app_config: AppConfig, company: Company
+) -> None:
+    from polska.budget import BudgetGuard
+    from polska.db.enums import TaskState, TaskType
+    from polska.orchestrator import _build_planner_prompt
+
+    task = Task(company_id=company.id, type=TaskType.RESEARCH, title="Read only", rationale="x")
+    session.add(task)
+    session.flush()
+    task.transition_to(TaskState.RUNNING)
+    task.transition_to(TaskState.DONE, result={"summary": "Found the thing."})
+    session.commit()
+
+    class _Runner:
+        budget_guard = BudgetGuard(app_config)
+
+    prompt = _build_planner_prompt(session, company.id, [], _Runner())
+    line = next(line for line in prompt.splitlines() if "Read only" in line)
+    assert "NOT APPLIED" not in line
+    assert "Found the thing." in line

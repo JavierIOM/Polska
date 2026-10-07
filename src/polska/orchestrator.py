@@ -35,7 +35,7 @@ from polska.config.company import (
     load_company_profile,
 )
 from polska.db.enums import ActivityKind, AgentName, GoalStatus, RunStatus, TaskState, TaskType
-from polska.db.models import Goal, Run, Task
+from polska.db.models import ActivityEvent, Goal, Run, Task
 from polska.db.state import ACTIVE_STATES
 from polska.db.types import utcday, utcnow
 from polska.dedup import deduplicate
@@ -153,12 +153,40 @@ _RUN_STATUS_REASON: dict[RunStatus, str] = {
 }
 
 
+def _dry_run_action_types(session: Session, task_id: int) -> list[str]:
+    """Action types this task had executed only by the dry-run adapter (chosen, or
+    substituted by ``integrations.force_dry_run``). Read from the activity feed, which
+    records the adapter that actually ran for every execution, approved or direct."""
+    events = session.execute(
+        select(ActivityEvent).where(
+            ActivityEvent.task_id == task_id, ActivityEvent.kind == ActivityKind.ACTION_EXECUTED
+        )
+    ).scalars()
+    return sorted(
+        {
+            (event.detail or {}).get("action_type", "action")
+            for event in events
+            if (event.detail or {}).get("adapter") == "dry_run"
+        }
+    )
+
+
 def _task_outcome_reason(session: Session, task: Task) -> str:
     """A structured, number-free description of why a concluded task ended the
     way it did. See ``_RUN_STATUS_REASON`` for why this replaces raw error text.
     """
     if task.state == TaskState.DONE:
-        return ((task.result or {}).get("summary") or "")[:300]
+        summary = (task.result or {}).get("summary") or ""
+        not_applied = _dry_run_action_types(session, task.id)
+        if not_applied:
+            # First, so the 300-character line limit can never cut it off. Found 7 Oct
+            # 2026: the planner treated a dry-run "commit and push" as landed and set the
+            # next task to mirror a change that was never in the repository.
+            return (
+                f"NOT APPLIED: its {', '.join(not_applied)} was approved but only recorded "
+                f"by the dry-run adapter, so whatever it changed does not exist. {summary}"
+            )[:300]
+        return summary[:300]
 
     if task.state == TaskState.ABANDONED:
         # Already structured and specific to this task (see fail_or_abandon):

@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-10-07
+
+### Fixed
+
+- **The planner no longer builds on changes that never landed.** With
+  `integrations.force_dry_run` on, an approved action is only recorded by the dry-run
+  adapter, yet the planner saw the task as plain "done". Task 26's DVLA log line
+  (approved, dry run) was then the basis for task 28, "mirror the DVLA log line", and
+  the engineer found the line did not exist. A done task whose actions only went
+  through the dry-run adapter now reads to the planner as `NOT APPLIED: its <action>
+  was approved but only recorded by the dry-run adapter, so whatever it changed does
+  not exist`, placed first so the line limit cannot cut it off. Worked out from the
+  activity feed, so tasks 26 to 28 are covered without any data change.
+
 ## [0.9.2] - 2026-10-07
 
 Found by checking what Javier's first two approvals actually did. Both executed (dry
