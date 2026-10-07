@@ -26,7 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from polska.activity import log
-from polska.budget import reconcile_orphaned_runs
+from polska.budget import active_halt, reconcile_orphaned_runs
 from polska.config.appconfig import AppConfig, LimitsConfig
 from polska.config.company import (
     CompanyProfile,
@@ -78,6 +78,7 @@ class TickSummary:
     __slots__ = (
         "company_id",
         "skipped_inactive",
+        "halted_by",
         "planner_status",
         "planner_error",
         "proposed",
@@ -91,6 +92,8 @@ class TickSummary:
     def __init__(self, company_id: int) -> None:
         self.company_id = company_id
         self.skipped_inactive = False
+        #: Set when an open budget halt stopped this tick before it planned anything.
+        self.halted_by: str | None = None
         #: How the planner's own run ended. Without this, "proposed=0" cannot tell a
         #: planner that chose to do nothing from one whose output was rejected.
         self.planner_status: RunStatus | None = None
@@ -193,22 +196,35 @@ def _build_planner_prompt(
             f"{goal.unit} ({goal.progress:.0%}), priority {goal.priority}"
         )
 
-    recent = session.execute(
-        select(Task)
-        .where(Task.company_id == company_id, Task.state.in_(_CONCLUDED_STATES))
-        .order_by(Task.updated_at.desc())
-        .limit(10)
-    ).scalars()
+    recent = list(
+        session.execute(
+            select(Task)
+            .where(Task.company_id == company_id, Task.state.in_(_CONCLUDED_STATES))
+            .order_by(Task.updated_at.desc())
+            .limit(10)
+        ).scalars()
+    )
 
     lines.append("")
     lines.append("Recent outcomes, most recent first:")
-    any_recent = False
     for task in recent:
-        any_recent = True
         outcome = _task_outcome_reason(session, task)
         lines.append(f"  - [{task.state.value}] {task.title}: {outcome}"[:300])
-    if not any_recent:
+    if not recent:
         lines.append("  (none yet)")
+
+    # AgentResult.observations: things a worker noticed outside its own task, which
+    # exist precisely so the next plan can act on them.
+    noticed = [
+        f"  - (task {task.id}) {str(note)[:200]}"
+        for task in recent
+        if task.state == TaskState.DONE
+        for note in ((task.result or {}).get("observations") or [])[:3]
+    ][:6]
+    if noticed:
+        lines.append("")
+        lines.append("Things recent workers noticed outside their own task, most recent first:")
+        lines.extend(noticed)
 
     active_count = session.execute(
         select(func.count(Task.id)).where(
@@ -278,6 +294,25 @@ async def run_company_tick(
                 company_id=company.id,
                 kind=ActivityKind.SCHEDULER_TICK,
                 summary=f"{company.slug} is inactive; tick skipped.",
+            )
+            session.commit()
+            return summary
+
+        halt = active_halt(session, company.id)
+        if halt is not None:
+            # An open halt already refuses every reservation. Planning and dispatching
+            # through it anyway only records a blocked run per agent, and charges each
+            # queued task an attempt for a run that never happens: three ticks of that
+            # and the task is abandoned without ever having run.
+            summary.halted_by = f"halt {halt.id} ({halt.limit_name})"
+            log(
+                session,
+                company_id=company.id,
+                kind=ActivityKind.BUDGET_HALT,
+                summary=(
+                    f"Tick skipped: {company.slug} is stopped by {summary.halted_by}. "
+                    "Clear it on the dashboard's budget page to resume."
+                ),
             )
             session.commit()
             return summary
@@ -404,6 +439,11 @@ class CycleResult:
             if summary.planner_status not in (None, RunStatus.SUCCEEDED)
         ]
 
+    @property
+    def halted(self) -> list[str]:
+        """Slugs an open budget halt stopped before anything was planned."""
+        return [slug for slug, summary in self.summaries.items() if summary.halted_by]
+
 
 def _reconcile_removed(session_factory: sessionmaker[Session], companies_dir: Path) -> None:
     try:
@@ -496,6 +536,14 @@ async def run_tick_cycle(
             continue
 
         result.summaries[slug] = summary
+        if summary.halted_by:
+            logger.warning(
+                "%s: stopped by %s, nothing planned or dispatched. Clear it on the "
+                "dashboard's budget page to resume.",
+                slug,
+                summary.halted_by,
+            )
+            continue
         logger.info(
             "%s: planner=%s proposed=%d enqueued=%d deduped_out=%d requeued=%d dispatched=%d",
             slug,
@@ -752,10 +800,17 @@ def run_startup_recovery(session_factory: sessionmaker[Session], app_config: App
     """Call exactly once, before the scheduler's first tick.
 
     Recovers any run left ``running`` by a process that died before it could
-    record what happened. See ``polska.budget.reconcile_orphaned_runs``.
+    record what happened (see ``polska.budget.reconcile_orphaned_runs``), then any
+    task that process left ``running`` too.
     """
     with session_factory() as session:
         orphans = reconcile_orphaned_runs(session, app_config)
+        interrupted = _reconcile_interrupted_tasks(session, app_config)
+    if interrupted:
+        logger.warning(
+            "Moved %d task(s) left running by an interrupted process out of running.",
+            interrupted,
+        )
     if orphans:
         logger.warning(
             "Recovered %d orphaned run(s) from an interrupted process, priced at "
@@ -763,3 +818,40 @@ def run_startup_recovery(session_factory: sessionmaker[Session], app_config: App
             "real cost is known, consider polska.budget.write_off_orphan.",
             len(orphans),
         )
+
+
+def _reconcile_interrupted_tasks(session: Session, app_config: AppConfig) -> int:
+    """Move every task left in ``running`` by a process that died mid-run out of it.
+
+    Only called at process start (and under the tick lock for a CLI tick), when no run
+    of this process can be in flight, so a ``running`` task here can only belong to a
+    process that was killed: a deploy recreating the container mid-tick is enough.
+    Nothing else ever moves a task out of ``running``, so before this it stayed there
+    for good, counting against ``max_concurrent_tasks``. Its attempt was already
+    counted when it entered ``running``.
+    """
+    limits = app_config.limits
+    reason = "Interrupted by a process restart before its run finished."
+    stuck = session.execute(select(Task).where(Task.state == TaskState.RUNNING)).scalars().all()
+    for task in stuck:
+        if task.attempts >= limits.max_attempts:
+            task.transition_to(
+                TaskState.ABANDONED,
+                result={
+                    "abandoned_reason": reason,
+                    "abandoned_because": f"attempts ({task.attempts}/{limits.max_attempts})",
+                    "attempts": task.attempts,
+                },
+            )
+        else:
+            task.transition_to(TaskState.FAILED, error=reason)
+        log(
+            session,
+            company_id=task.company_id,
+            kind=ActivityKind.TASK_STATE_CHANGED,
+            summary=f"{reason} Now {task.state.value}: {task.title}",
+            task_id=task.id,
+        )
+    if stuck:
+        session.commit()
+    return len(stuck)

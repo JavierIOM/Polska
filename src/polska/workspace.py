@@ -391,6 +391,11 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
                 "refusing to layer a fresh install on top of an unknown partial one."
             )
 
+    # --ignore-scripts: package lifecycle scripts are third-party code, and this runs as
+    # the scheduler user. On the cron tick path that user is not under no-new-privs, so
+    # such a script could use setpriv's file capability to become root in the container
+    # (checked live, 7 Oct 2026) and remove the agent's network jail. CarScratch's full
+    # test suite passes on a tree installed this way (10/10, run as the agent user).
     lockfile = repo_dir / "package-lock.json"
     if lockfile.exists():
         # The common case, a clone made after this existed: deterministic
@@ -398,7 +403,7 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
         # lockfile and package.json have drifted, rather than silently
         # resolving something slightly different from what the repository's
         # own CI would install.
-        command = ["npm", "ci", "--no-audit", "--no-fund"]
+        command = ["npm", "ci", "--no-audit", "--no-fund", "--ignore-scripts"]
     else:
         # An old clone: _strip_low_value_files already removed its lockfile,
         # from long before this function existed to need it kept. Re-fetching
@@ -415,7 +420,7 @@ def _ensure_node_dependencies_vendored(repo_dir: Path, task_id: int) -> None:
             "of the clone credential.",
             task_id,
         )
-        command = ["npm", "install", "--no-audit", "--no-fund"]
+        command = ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"]
 
     try:
         subprocess.run(

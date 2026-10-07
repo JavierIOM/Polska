@@ -28,7 +28,6 @@ limits:
   # A task failing this many times is abandoned rather than requeued. It can
   # also be abandoned sooner than this on cost: see budget.max_usd_per_task.
   max_attempts: 3
-  task_timeout_seconds: 900
   # Wall-clock backoff before a failed task is eligible for another attempt,
   # measured from the task's own last transition, not a count of ticks:
   # min(retry_base_delay_seconds * retry_backoff_multiplier ** (attempts - 1),
@@ -65,7 +64,6 @@ dedup:
   lookback_days: 14
   high_threshold: 90
   low_threshold: 60
-  judge_model: claude-haiku-4-5
   judge_enabled: true
 
 approvals:
@@ -84,7 +82,6 @@ approvals:
   unknown_action_is_irreversible: true
 
 integrations:
-  default_adapter: dry_run
   # Global off switch. While true, an approved action is still only logged.
   # Phase 1 has no real adapters, so this stays true until they exist.
   force_dry_run: true

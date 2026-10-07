@@ -64,7 +64,6 @@ def test_the_support_agent_cannot_write_anywhere(app_config: AppConfig) -> None:
 def test_integrations_ship_in_dry_run(app_config: AppConfig) -> None:
     """Phase 1 has no real adapters, so the global switch must be on."""
     assert app_config.integrations.force_dry_run
-    assert app_config.integrations.default_adapter == "dry_run"
 
 
 # ------------------------------------------------------------------------- budgets

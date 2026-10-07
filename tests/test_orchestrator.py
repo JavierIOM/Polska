@@ -289,7 +289,7 @@ class _ScriptedRunner:
             else {
                 "succeeded": True,
                 "summary": "done",
-                "output": {},
+                "output": {"note": "done"},
             }
         )
         return await self._make_runner(output).run_worker(session, **kwargs)
@@ -447,8 +447,8 @@ async def test_a_task_is_dispatched_up_to_max_concurrent_and_moves_to_done(
         ]
     }
     worker_outputs = [
-        {"succeeded": True, "summary": "Drafted A.", "output": {}},
-        {"succeeded": True, "summary": "Researched B.", "output": {}},
+        {"succeeded": True, "summary": "Drafted A.", "output": {"note": "done"}},
+        {"succeeded": True, "summary": "Researched B.", "output": {"note": "done"}},
     ]
     runner = _ScriptedRunner(config, plan, worker_outputs)
 
@@ -489,7 +489,7 @@ async def test_dispatch_respects_max_concurrent_and_leaves_the_rest_queued(
         ]
     }
     runner = _ScriptedRunner(
-        config, plan, [{"succeeded": True, "summary": "Drafted A.", "output": {}}]
+        config, plan, [{"succeeded": True, "summary": "Drafted A.", "output": {"note": "done"}}]
     )
 
     loaded = _profile()
@@ -550,7 +550,7 @@ async def test_a_failed_task_past_its_backoff_is_requeued_and_redispatched(
     )
     plan = {"tasks": [], "no_action_reason": "Only testing retry."}
     runner = _ScriptedRunner(
-        config, plan, [{"succeeded": True, "summary": "Retried ok.", "output": {}}]
+        config, plan, [{"succeeded": True, "summary": "Retried ok.", "output": {"note": "done"}}]
     )
 
     summary = await run_company_tick(session_factory, config, runner, loaded, workspace_root)
@@ -596,7 +596,9 @@ async def test_a_fatal_cli_error_during_dispatch_propagates_after_others_are_acc
                 raise CLIConnectionError("cli gone")
             return await super().run_worker(session, **kwargs)
 
-    runner = ExplodingRunner(config, plan, [{"succeeded": True, "summary": "ok", "output": {}}])
+    runner = ExplodingRunner(
+        config, plan, [{"succeeded": True, "summary": "ok", "output": {"note": "done"}}]
+    )
 
     loaded = _profile()
     with pytest.raises(CLIConnectionError):
@@ -692,3 +694,29 @@ async def test_a_workspace_os_error_fails_the_task_instead_of_poisoning_every_ti
     assert runner.ran is False
     assert [failed_id for failed_id, _ in runner.failed] == [task_id]
     assert "Permission denied" in runner.failed[0][1]
+
+
+def test_startup_recovery_moves_tasks_left_running_out_of_running(
+    session_factory, session, company, app_config
+) -> None:
+    """A deploy recreating the container mid-tick killed the tick but left its tasks in
+    running, where nothing ever moved them again."""
+    from polska.db.enums import TaskState, TaskType
+    from polska.db.models import Task
+    from polska.orchestrator import run_startup_recovery
+
+    retryable = Task(company_id=company.id, type=TaskType.RESEARCH, title="One", rationale="x")
+    spent = Task(company_id=company.id, type=TaskType.RESEARCH, title="Two", rationale="x")
+    session.add_all([retryable, spent])
+    session.flush()
+    retryable.transition_to(TaskState.RUNNING)
+    spent.transition_to(TaskState.RUNNING)
+    spent.attempts = app_config.limits.max_attempts
+    session.commit()
+
+    run_startup_recovery(session_factory, app_config)
+
+    session.expire_all()
+    assert retryable.state == TaskState.FAILED
+    assert "process restart" in retryable.error
+    assert spent.state == TaskState.ABANDONED

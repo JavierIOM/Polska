@@ -246,3 +246,54 @@ async def test_an_unknown_slug_raises_before_any_housekeeping_runs(
         )
 
     assert calls == []
+
+
+async def test_a_halted_company_is_neither_planned_for_nor_dispatched(
+    session_factory, app_config: AppConfig, companies_dir: Path, tmp_path: Path
+) -> None:
+    """An open halt refuses every reservation anyway. Planning and dispatching through
+    it only wrote a blocked run per agent and charged each queued task an attempt for a
+    run that never happened, so three ticks abandoned a task that never ran."""
+    from polska.budget import write_halt
+    from polska.db.enums import ActivityKind, BudgetScope, TaskState, TaskType
+    from polska.db.models import ActivityEvent, Task
+
+    _write_profile(companies_dir, "co")
+    await run_tick_cycle(
+        session_factory, app_config, _EmptyPlanRunner(), companies_dir, tmp_path / "workspaces"
+    )
+    with session_factory() as session:
+        company = session.execute(select(Company)).scalar_one()
+        write_halt(
+            session,
+            company_id=company.id,
+            scope=BudgetScope.RUN,
+            limit_name="mid_run_watchdog",
+            limit_value=1.0,
+            observed_value=2.0,
+            period_key=None,
+            reason="test",
+        )
+        queued = Task(
+            company_id=company.id, type=TaskType.RESEARCH, title="Queued work", rationale="x"
+        )
+        session.add(queued)
+        session.commit()
+        task_id = queued.id
+
+    class MustNotPlan(_EmptyPlanRunner):
+        async def run_planner(self, session, **kwargs):
+            raise AssertionError("a halted company must not be planned for")
+
+    result = await run_tick_cycle(
+        session_factory, app_config, MustNotPlan(), companies_dir, tmp_path / "workspaces"
+    )
+
+    assert result.halted == ["co"]
+    assert result.summaries["co"].halted_by.endswith("(mid_run_watchdog)")
+    with session_factory() as session:
+        task = session.get(Task, task_id)
+        assert task.state == TaskState.QUEUED
+        assert task.attempts == 0
+        kinds = [e.kind for e in session.execute(select(ActivityEvent)).scalars()]
+        assert ActivityKind.BUDGET_HALT in kinds

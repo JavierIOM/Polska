@@ -413,11 +413,19 @@ is off and the droplet's own cron runs the tick instead, as `javier`:
 ```
 
 `crontab -l` shows it; `tail ~/polska-tick.log` shows what each tick did (one line per
-company with `planner=<status>`, exit 1 on any failure). `flock` stops two ticks
-overlapping, which matters because every `polska.cli tick` starts by reconciling any run
-still marked `running`, which it would wrongly treat as orphaned if another tick were in
-flight. When the privilege model is fixed, set `scheduler.enabled: true` in
+company with `planner=<status>`, or why it was stopped, exit 1 on any failure or halt).
+Ticks cannot overlap: every tick, cron or manual, takes a lock file under `data/`
+(since 0.9.0), because each `polska.cli tick` starts by treating any run still marked
+`running` as orphaned. When the privilege model is fixed, set `scheduler.enabled: true` in
 `config/default.yaml` and delete the cron entry in the same change, or both will tick.
+
+**Security note.** This path is not equivalent to the in-container job. An `exec`'d tick
+runs as uid 1000 without `--no-new-privs`, and from there `setpriv --reuid=0` gives root in
+the container (checked 7 Oct 2026), which could remove the agent's network jail. The agent
+itself is unaffected: the wrapper drops it to uid 1001 under its own `--no-new-privs`.
+Since 0.9.0 the main untrusted code that used to run in that state, npm install scripts
+during vendoring, no longer runs (`--ignore-scripts`). What remains is trusted code
+(Polska itself, git). The real fix is the privilege-model decision in CHANGELOG 0.9.0.
 
 ### Upgrading a deployment that predates the non-root container user
 

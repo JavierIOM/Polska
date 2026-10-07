@@ -8,6 +8,7 @@ would yield them, and checks what the runner does with that stream.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -1327,3 +1328,169 @@ async def test_an_exception_from_the_sdk_call_closes_the_run_row_instead_of_leav
         select(ActivityEvent).where(ActivityEvent.kind == ActivityKind.ERROR)
     ).scalars()
     assert [e.run_id for e in errors] == [rows[0].id]
+
+
+# ------------------------------------------------ structured-output recovery, real shapes
+
+
+def _call(input_: object, name: str = "StructuredOutput") -> dict[str, object]:
+    return {"id": "x", "name": name, "input": input_, "is_error": None}
+
+
+_VALID_PLAN = {"tasks": [], "no_action_reason": "Nothing to do."}
+
+
+@pytest.mark.parametrize(
+    "call_input",
+    [
+        _VALID_PLAN,  # the accepted shape, seen on every successful run
+        {"input": json.dumps(_VALID_PLAN)},  # wrapped as a JSON string
+        {"response": _VALID_PLAN},  # wrapped as a dict
+        {"$PARAMETER_NAME": "output", "$PARAMETER_VALUE": json.dumps(_VALID_PLAN)},
+    ],
+    ids=["fields-directly", "input-json-string", "response-dict", "parameter-value"],
+)
+def test_structured_output_is_recovered_from_every_shape_seen_live(call_input) -> None:
+    """7 Oct 2026: the accepted StructuredOutput call carries the fields directly. The
+    recovery code only ever looked for input["input"] as a string, so it could never
+    match the shape that is actually accepted."""
+    from polska.runner import _recover_structured_output
+    from polska.schemas.planner import PlannerOutput
+
+    recovered = _recover_structured_output([_call(call_input)], PlannerOutput)
+
+    assert recovered is not None
+    assert recovered[1].no_action_reason == "Nothing to do."
+
+
+def test_structured_output_recovery_takes_the_last_valid_call_and_ignores_junk() -> None:
+    from polska.runner import _recover_structured_output
+    from polska.schemas.planner import PlannerOutput
+
+    later = {"tasks": [], "no_action_reason": "The later answer."}
+    calls = [
+        _call(_VALID_PLAN),
+        _call(later),
+        _call({"$PARAMETER_NAME": "output"}),  # malformed, validates as nothing
+        _call({"file_path": "x"}, name="Read"),
+    ]
+
+    recovered = _recover_structured_output(calls, PlannerOutput)
+
+    assert recovered is not None
+    assert recovered[1].no_action_reason == "The later answer."
+    assert _recover_structured_output([_call({"junk": 1})], PlannerOutput) is None
+
+
+# ------------------------------------------------------------- worker outcome contracts
+
+
+async def test_success_with_no_output_and_no_actions_is_not_counted_as_done(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """AgentResult's own contract: success on the agent's say-so alone, with nothing to
+    show for it, is not success. Nothing enforced that before."""
+    result_msg = _result_message(
+        structured_output={"succeeded": True, "summary": "All done."},
+        model_usage=PLANNER_USAGE,
+    )
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft it.",
+    )
+
+    assert task.state == TaskState.FAILED
+    assert "no output and no actions" in task.error
+
+
+async def test_observations_are_kept_and_reach_the_next_plan(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """AgentResult.observations is documented as fed to the next plan. It was validated
+    and then thrown away."""
+    from polska.orchestrator import _build_planner_prompt
+
+    result_msg = _result_message(
+        structured_output={
+            "succeeded": True,
+            "summary": "Drafted it.",
+            "output": {"draft": "hello"},
+            "observations": ["The pricing page still says 2024."],
+            "iterations_attempted": 1,
+        },
+        model_usage=PLANNER_USAGE,
+    )
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query(result_msg),
+    )
+
+    await runner.run_worker(
+        session,
+        agent_name=AgentName.MARKETER,
+        task=task,
+        company_profile=_profile(),
+        user_prompt="Draft it.",
+    )
+
+    assert task.state == TaskState.DONE
+    assert task.result["observations"] == ["The pricing page still says 2024."]
+    assert task.result["iterations_attempted"] == 1
+    prompt = _build_planner_prompt(session, company.id, [], runner)
+    assert "The pricing page still says 2024." in prompt
+
+
+async def test_a_worker_whose_launch_raises_is_not_left_running(
+    session,
+    app_config: AppConfig,
+    budget_guard: BudgetGuard,
+    registry: AdapterRegistry,
+    company: Company,
+    task: Task,
+) -> None:
+    """Nothing else ever moves a task out of running, so a launch failure left it there
+    for good, counting against max_concurrent_tasks."""
+    runner = AgentRunner(
+        app_config=app_config,
+        budget_guard=budget_guard,
+        adapter_registry=registry,
+        query_fn=_fake_query_raising(
+            ProcessError("Command failed with exit code 127", exit_code=127)
+        ),
+    )
+
+    with pytest.raises(ProcessError):
+        await runner.run_worker(
+            session,
+            agent_name=AgentName.MARKETER,
+            task=task,
+            company_profile=_profile(),
+            user_prompt="Draft it.",
+        )
+
+    session.rollback()
+    assert task.state == TaskState.FAILED
+    assert task.attempts == 1
+    assert "ProcessError" in task.error

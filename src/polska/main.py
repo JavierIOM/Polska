@@ -28,6 +28,7 @@ from polska.db.base import make_engine, make_session_factory
 from polska.db.schema_check import assert_schema_is_current
 from polska.orchestrator import run_startup_recovery, run_tick_cycle
 from polska.runner import AgentRunner
+from polska.ticklock import tick_lock, tick_lock_path
 
 logger = logging.getLogger("polska.main")
 
@@ -41,7 +42,11 @@ async def _tick_all_companies(
 ) -> None:
     """Fired on every scheduler interval. The work itself lives in
     :func:`polska.orchestrator.run_tick_cycle`, shared with ``polska-cli tick``."""
-    await run_tick_cycle(session_factory, app_config, runner, companies_dir, workspace_root)
+    with tick_lock(tick_lock_path(workspace_root)) as acquired:
+        if not acquired:
+            logger.warning("Another tick is already running; this one is skipped.")
+            return
+        await run_tick_cycle(session_factory, app_config, runner, companies_dir, workspace_root)
 
 
 async def main() -> None:

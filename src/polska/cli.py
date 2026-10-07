@@ -20,13 +20,14 @@ import sys
 from polska.adapters.registry import AdapterRegistry
 from polska.budget import BudgetGuard
 from polska.config.appconfig import load_app_config
-from polska.config.settings import load_settings
+from polska.config.settings import Settings, load_settings
 from polska.dashboard.security import hash_password
 from polska.db.base import make_engine, make_session_factory
 from polska.db.enums import RunStatus
 from polska.db.schema_check import assert_schema_is_current
 from polska.orchestrator import UnknownCompanyError, run_startup_recovery, run_tick_cycle
 from polska.runner import AgentRunner
+from polska.ticklock import tick_lock, tick_lock_path
 
 
 def _init_auth() -> None:
@@ -77,14 +78,25 @@ async def _tick(slug: str | None) -> None:
     """Run exactly one planning/dispatch cycle now, for one company or all of
     them, then exit. The same function the scheduler calls on its own interval
     (``run_tick_cycle``); this is the manual override for "not 24 hours from now".
-    Exits 1 if any company failed or any planner run did not succeed."""
+    Exits 1 if another tick is running, a company failed or was halted, or a planner
+    run did not succeed."""
     settings = load_settings()
     logging.basicConfig(level=settings.log_level)
+    with tick_lock(tick_lock_path(settings.workspace_root)) as acquired:
+        if not acquired:
+            print("Another tick is already running; not starting a second.", file=sys.stderr)
+            raise SystemExit(1)
+        await _tick_holding_lock(settings, slug)
+
+
+async def _tick_holding_lock(settings: Settings, slug: str | None) -> None:
     app_config = load_app_config(settings.config_path)
     engine = make_engine(settings.database_url, echo=settings.sql_echo)
     assert_schema_is_current(engine)
     session_factory = make_session_factory(engine)
 
+    # Safe only because the tick lock is held: any run or task still marked running
+    # now really was left behind by a process that died.
     run_startup_recovery(session_factory, app_config)
 
     registry = AdapterRegistry()
@@ -110,6 +122,12 @@ async def _tick(slug: str | None) -> None:
         raise SystemExit(1) from None
 
     for company, summary in result.summaries.items():
+        if summary.halted_by:
+            print(
+                f"{company}: stopped by {summary.halted_by}, nothing planned or dispatched. "
+                "Clear it on the dashboard's budget page to resume."
+            )
+            continue
         status = summary.planner_status.value if summary.planner_status else "n/a"
         print(
             f"{company}: planner={status} proposed={summary.proposed} "
@@ -119,7 +137,7 @@ async def _tick(slug: str | None) -> None:
         if summary.planner_status not in (None, RunStatus.SUCCEEDED):
             print(f"  planner error: {(summary.planner_error or '')[:400]}", file=sys.stderr)
 
-    if result.failed or result.planner_problems:
+    if result.failed or result.planner_problems or result.halted:
         raise SystemExit(1)
 
 

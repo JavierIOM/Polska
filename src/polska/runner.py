@@ -163,16 +163,34 @@ def _recover_structured_output(
     for call in reversed(tools_called):
         if call.get("name") != _STRUCTURED_OUTPUT_TOOL_NAME:
             continue
-        raw = call.get("input", {}).get("input")
-        if not isinstance(raw, str):
-            continue
-        try:
-            structured = json.loads(raw)
-            validated = schema_model.model_validate(structured)
-        except (ValueError, ValidationError):
-            continue
-        return structured, validated
+        for structured in _structured_output_candidates(call.get("input")):
+            try:
+                validated = schema_model.model_validate(structured)
+            except ValidationError:
+                continue
+            return structured, validated
     return None
+
+
+def _structured_output_candidates(call_input: Any) -> list[Any]:
+    """Every payload one StructuredOutput call might carry. Checked against real runs,
+    7 Oct 2026: the accepted shape is the fields directly as the tool input; the
+    model's malformed first attempts (8 of 10 runs) wrap them under one key
+    (``input``, ``response``, ``parameter``, ``$PARAMETER_VALUE``), sometimes as a JSON
+    string. The original version only looked for ``input["input"]`` as a string, so it
+    could never match the shape that is actually accepted."""
+    if not isinstance(call_input, dict):
+        return []
+    candidates: list[Any] = [call_input]
+    for value in call_input.values():
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    return candidates
 
 
 class _RunningUsage:
@@ -378,16 +396,26 @@ class AgentRunner:
         task.transition_to(TaskState.RUNNING)
         session.commit()
 
-        outcome = await self._invoke(
-            session,
-            agent_name=agent_name,
-            company_id=task.company_id,
-            task=task,
-            company_profile=company_profile,
-            user_prompt=user_prompt,
-            schema_model=AgentResult,
-            cwd=workspace,
-        )
+        try:
+            outcome = await self._invoke(
+                session,
+                agent_name=agent_name,
+                company_id=task.company_id,
+                task=task,
+                company_profile=company_profile,
+                user_prompt=user_prompt,
+                schema_model=AgentResult,
+                cwd=workspace,
+            )
+        except Exception as exc:
+            # The task was committed as `running` above. Nothing else ever moves a task
+            # out of `running`, so without this a launch failure left it there for good,
+            # counting against max_concurrent_tasks.
+            session.rollback()
+            self.fail_or_abandon(
+                session, task, f"The agent could not be run: {type(exc).__name__}: {exc}"[:2000]
+            )
+            raise
 
         result = outcome.output
         if not isinstance(result, AgentResult):
@@ -409,6 +437,18 @@ class AgentRunner:
             )
             return outcome
 
+        if not result.output and not result.actions:
+            # AgentResult's own contract: success on the agent's say-so alone, with
+            # nothing to show for it, is not success.
+            self.fail_or_abandon(
+                session,
+                task,
+                "Reported success with no output and no actions, so there is nothing to "
+                "verify it by.",
+                run_status=outcome.run.status,
+            )
+            return outcome
+
         any_pending = False
         for action in result.actions:
             approval = await dispatch_action(
@@ -423,7 +463,14 @@ class AgentRunner:
             if approval is not None and approval.is_pending:
                 any_pending = True
 
-        task_result = {"summary": result.summary, "output": result.output}
+        task_result = {
+            "summary": result.summary,
+            "output": result.output,
+            # Both were validated and then thrown away. Observations are what the next
+            # plan reads (see orchestrator._build_planner_prompt).
+            "observations": result.observations,
+            "iterations_attempted": result.iterations_attempted,
+        }
         if any_pending:
             task.transition_to(TaskState.AWAITING_APPROVAL, result=task_result)
         else:

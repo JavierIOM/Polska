@@ -406,7 +406,7 @@ def test_node_modules_without_the_marker_is_treated_as_partial_and_redone(
     with caplog.at_level("WARNING", logger="polska.workspace"):
         _ensure_node_dependencies_vendored(tmp_path, task_id=1)
 
-    assert calls == [["npm", "ci", "--no-audit", "--no-fund"]]
+    assert calls == [["npm", "ci", "--no-audit", "--no-fund", "--ignore-scripts"]]
     assert any("without a completion marker" in r.getMessage() for r in caplog.records)
     assert (node_modules / _VENDORED_MARKER_NAME).exists()
     assert not (node_modules / "half-installed-package").exists()
@@ -428,7 +428,7 @@ def test_vendoring_runs_npm_ci_against_the_lockfile(tmp_path, monkeypatch) -> No
 
     assert len(calls) == 1
     args, cwd = calls[0]
-    assert args == ["npm", "ci", "--no-audit", "--no-fund"]
+    assert args == ["npm", "ci", "--no-audit", "--no-fund", "--ignore-scripts"]
     assert cwd == tmp_path
 
 
@@ -498,7 +498,7 @@ def test_a_clone_missing_only_the_lockfile_falls_back_to_npm_install(
     with caplog.at_level("WARNING", logger="polska.workspace"):
         _ensure_node_dependencies_vendored(tmp_path, task_id=9)
 
-    assert calls == [["npm", "install", "--no-audit", "--no-fund"]]
+    assert calls == [["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"]]
     assert any("predates dependency vendoring" in r.getMessage() for r in caplog.records)
 
 

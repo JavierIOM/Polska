@@ -74,8 +74,7 @@ class BudgetExceeded(Exception):
         self.halt = halt
         if halt.is_token_denominated:
             figures = (
-                f"{halt.observed_value:.0f} tokens against a limit of "
-                f"{halt.limit_value:.0f} tokens"
+                f"{halt.observed_value:.0f} tokens against a limit of {halt.limit_value:.0f} tokens"
             )
         else:
             figures = f"${halt.observed_value:.4f} against a limit of ${halt.limit_value:.2f}"
@@ -514,6 +513,11 @@ def write_off_orphan(
             f"Run {run.id} is {run.status}, not orphaned. write_off_orphan only "
             "corrects the worst-case price reconcile_orphaned_runs assigned; it is "
             "not a general way to edit a run's recorded cost."
+        )
+    if actual_cost_usd < 0:
+        raise ValueError(
+            f"A cost of ${actual_cost_usd:.4f} is negative, which would reduce the ledger "
+            "below what was actually spent."
         )
 
     previous_cost_usd = run.cost_usd

@@ -5,6 +5,65 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-07
+
+A full read of the codebase after a run of reactive fixes. Each finding was checked
+against the code, and where possible against the live droplet's database or processes,
+before it was fixed.
+
+### Correction to 0.8.8
+
+- 0.8.8 said ticking from cron changed no security boundary. That was wrong. The cron
+  tick runs as uid 1000 without `--no-new-privs`, and from there `setpriv --reuid=0`
+  gives root in the container (checked: `uid=0(root)`). Root there holds NET_ADMIN and
+  could remove the agent's network jail. Manual ticks always had this; 0.8.8 made it the
+  daily path. This release closes the main untrusted route into that process (npm
+  install scripts, below). The rest is the open privilege-model decision.
+
+### Fixed
+
+- **A budget halt now stops the tick before planning.** An open halt already refused
+  every reservation, but the tick planned and dispatched through it anyway: a blocked run
+  per agent, and every queued task charged an attempt for a run that never happened, so
+  three ticks abandoned a task that never ran. The tick now records why it stopped, and
+  `polska-cli tick` prints it and exits 1.
+- **Recovering a cut-off run's answer could never work.** It looked for
+  `input["input"]` as a JSON string; the accepted `StructuredOutput` call carries the
+  fields directly (checked across ten real runs). It now reads every shape seen live.
+- **Success with no output and no actions is no longer counted as done**, as
+  `AgentResult` always said it would be.
+- **`observations` and `iterations_attempted` are kept** in the task result instead of
+  being validated and discarded, and observations now reach the next planner prompt,
+  as the schema documented.
+- **A worker whose launch raises is moved out of `running`**, with an attempt counted.
+  Nothing else ever moves a task out of `running`, so it stayed there for good,
+  holding a concurrency slot.
+- **Startup recovery also moves tasks left in `running`** by a process that died (a
+  deploy recreating the container mid-tick is enough), not just their runs.
+- **Ticks can no longer overlap.** Each `polska-cli tick` starts by treating every
+  `running` run as orphaned, so one started during another mis-priced the first's live
+  runs. A lock file under `data/` now covers the scheduler job and every CLI tick.
+- **Vendoring runs npm with `--ignore-scripts`.** Package install scripts are
+  third-party code running as uid 1000, which on the cron path can reach root (above).
+  CarScratch's full test suite passes on a tree installed this way (10/10, as the agent
+  user).
+- `write_off_orphan` refuses a negative cost.
+
+### Removed
+
+- Config settings no code ever read: `limits.task_timeout_seconds`, `dedup.judge_model`,
+  `integrations.default_adapter`, and each agent's `enabled`. Each read like a control and
+  did nothing; setting an agent's `enabled: false` did not stop it being dispatched. A
+  config that still sets one now fails validation, as any unknown key does.
+
+### Still open, decisions for Javier
+
+- carscratch is halted now (halts 27 and 28, written when run 80 crossed the engineer's
+  token ceiling). Nothing runs until it is cleared on the dashboard's budget page.
+- The engineer's token ceiling sits below what `max_turns` allows (see 0.8.9).
+- The privilege model (narrow `sudo` design in wiki `polska.md`).
+- The planner once read its own `$0.25` per-run cap as the day's budget.
+
 ## [0.8.9] - 2026-10-07
 
 Found by the first full tick through the new cron line (19:13 UTC, 4m12s, exit 0, $0.92):

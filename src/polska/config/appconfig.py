@@ -52,7 +52,6 @@ class LimitsConfig(BaseModel):
     #: See also budget.max_usd_per_task: a task can also be abandoned for cost
     #: before it ever reaches this many attempts.
     max_attempts: int = Field(default=3, ge=1)
-    task_timeout_seconds: int = Field(default=900, ge=30)
 
     retry_base_delay_seconds: int = Field(default=900, ge=0)
     retry_backoff_multiplier: float = Field(default=2.0, ge=1.0)
@@ -153,8 +152,8 @@ class DedupConfig(BaseModel):
     high_threshold: int = Field(default=90, ge=0, le=100)
     #: At or below this, it is novel. No judge call.
     low_threshold: int = Field(default=60, ge=0, le=100)
-    #: Only the band between the two thresholds costs a model call.
-    judge_model: str = "claude-haiku-4-5"
+    #: Only the band between the two thresholds costs a model call. The judge's
+    #: model is ``agents.dedup_judge.model``, like every other agent's.
     judge_enabled: bool = True
 
     @model_validator(mode="after")
@@ -181,7 +180,6 @@ class AgentConfig(BaseModel):
     tools: list[str] = Field(default_factory=list)
     max_turns: int = Field(default=20, ge=1)
     timeout_seconds: int = Field(default=600, ge=30)
-    enabled: bool = True
     #: Extra text appended to the agent's built-in system prompt.
     system_prompt_extra: str = ""
     #: Thinking depth, passed straight to the SDK's own `effort`. None leaves the
@@ -268,11 +266,11 @@ class ModelPricing(BaseModel):
 
 
 class IntegrationsConfig(BaseModel):
-    """Which adapter is used when a profile does not name one."""
+    """The global dry-run switch. Which adapter an action uses is named by the
+    action itself (``ActionRequest.adapter``)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    default_adapter: str = "dry_run"
     #: A global off switch. With this true, even an approved action only logs.
     force_dry_run: bool = True
 
@@ -309,8 +307,6 @@ class AppConfig(BaseModel):
     def _every_model_is_priced(self) -> Self:
         """A model with no price cannot be budgeted, so it cannot be used."""
         used = {agent.model for agent in self.agents.values()}
-        if self.dedup.judge_enabled:
-            used.add(self.dedup.judge_model)
         unpriced = sorted(used - set(self.pricing))
         if unpriced:
             raise ValueError(

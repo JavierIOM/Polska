@@ -665,3 +665,14 @@ def test_actual_usd_for_task_is_zero_for_a_task_with_no_runs(session: Session) -
     from polska.budget import actual_usd_for_task
 
     assert actual_usd_for_task(session, 999) == 0.0
+
+
+def test_a_negative_write_off_is_refused(
+    session: Session, tight_config: AppConfig, company: Company
+) -> None:
+    from polska.budget import write_off_orphan
+
+    orphan = _run(session, company, status=RunStatus.ORPHANED, cost_usd=1.0)
+    with pytest.raises(ValueError, match="negative"):
+        write_off_orphan(session, orphan, actual_cost_usd=-5.0, decided_by="javier")
+    assert orphan.status == RunStatus.ORPHANED
