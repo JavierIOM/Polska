@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "polska"
-version = "0.8.6"
+version = "0.8.7"
 description = "Autonomous company operator: an orchestrator that plans work and dispatches agents on a schedule."
 requires-python = ">=3.12"
 license = { text = "Proprietary" }

@@ -1315,6 +1315,9 @@ async def test_an_exception_from_the_sdk_call_closes_the_run_row_instead_of_leav
             session, company_id=company.id, company_profile=_profile(), user_prompt="What next?"
         )
 
+    # The caller's session is discarded when the exception propagates out of the tick, so
+    # anything only flushed (not committed) is lost. Read back what actually survived.
+    session.rollback()
     rows = session.execute(select(Run)).scalars().all()
     assert len(rows) == 1
     assert rows[0].status == RunStatus.FAILED

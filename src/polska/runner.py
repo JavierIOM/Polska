@@ -865,6 +865,9 @@ class AgentRunner:
                 run_id=run.id,
                 error=description,
             )
+            # log() only flushes. Nothing commits after this re-raise, and the session is
+            # rolled back as the exception leaves the tick, which would lose the event.
+            session.commit()
             raise
 
         if status == RunStatus.INTERRUPTED:

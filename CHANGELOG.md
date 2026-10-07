@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.7] - 2026-10-07
+
+Found by running 0.8.6 under the real failure (a tick as uid 1000 with `--no-new-privs`)
+after deploying it: the run row now closed correctly, but the `error` activity event it
+was meant to write never reached the feed.
+
+### Fixed
+
+- The `error` event was only flushed, never committed (`activity.log` flushes by design).
+  The exception that follows rolls the session back as it leaves the tick, so the event
+  was lost; the run row survived only because `_finalize_run` commits. Now committed. The
+  test reads back after a rollback, so it can tell the difference (the first version read
+  through the same session and passed regardless).
+
 ## [0.8.6] - 2026-10-07
 
 Four planner rows sat in `running` on the dashboard from 3 to 6 Oct, with no tokens and
