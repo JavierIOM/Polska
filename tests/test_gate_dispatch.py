@@ -464,3 +464,134 @@ async def test_an_adapter_that_raises_marks_execution_failed_and_logs_an_error(
 
     kinds = [e.kind for e in _feed(session)]
     assert ActivityKind.ERROR in kinds
+
+
+# --------------------------------------------------- a task leaves awaiting_approval
+
+
+async def _parked_task(session: Session, app_config: AppConfig, registry, company, *types):
+    """A task in awaiting_approval with one pending approval per action type."""
+    from polska.db.enums import TaskState, TaskType
+
+    task = Task(company_id=company.id, type=TaskType.ENGINEERING, title="Ship it", rationale="x")
+    session.add(task)
+    session.flush()
+    task.transition_to(TaskState.RUNNING)
+    approvals = [
+        await dispatch_action(
+            session,
+            app_config,
+            registry,
+            company_id=company.id,
+            task_id=task.id,
+            run_id=None,
+            action=_action(action_type=action_type),
+        )
+        for action_type in types
+    ]
+    task.transition_to(
+        TaskState.AWAITING_APPROVAL, result={"summary": "did it", "output": {"a": 1}}
+    )
+    session.commit()
+    return task, approvals
+
+
+async def test_approving_and_executing_every_action_completes_the_task(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    """7 Oct 2026: both approvals executed, yet the tasks stayed awaiting_approval, which
+    counts against max_concurrent_tasks, so dispatch stopped for good."""
+    from polska.db.enums import TaskState
+
+    task, (first, second) = await _parked_task(
+        session, app_config, registry, company, "email.send", "social.publish"
+    )
+
+    await execute_approval(
+        session,
+        app_config,
+        registry,
+        decide_approval(session, first, approved=True, decided_by="javier"),
+    )
+    assert task.state == TaskState.AWAITING_APPROVAL  # one still pending
+
+    await execute_approval(
+        session,
+        app_config,
+        registry,
+        decide_approval(session, second, approved=True, decided_by="javier"),
+    )
+    assert task.state == TaskState.DONE
+    assert task.result["summary"] == "did it"
+
+
+async def test_a_rejection_abandons_the_task(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    from polska.db.enums import TaskState
+
+    task, (approval,) = await _parked_task(session, app_config, registry, company, "email.send")
+
+    decide_approval(session, approval, approved=False, decided_by="javier")
+
+    assert task.state == TaskState.ABANDONED
+    assert "rejected" in task.result["abandoned_because"]
+    assert task.result["summary"] == "did it"
+
+
+async def test_an_approved_action_that_fails_to_execute_fails_the_task(
+    session: Session, app_config: AppConfig, company: Company
+) -> None:
+    from polska.db.enums import TaskState
+
+    class Broken(DryRunAdapter):
+        async def execute(self, action_type: str, payload: dict[str, Any]) -> AdapterResult:
+            return AdapterResult(succeeded=False, error="remote said no")
+
+    registry = AdapterRegistry()
+    registry.register(Broken())
+    task, (approval,) = await _parked_task(session, app_config, registry, company, "email.send")
+
+    await execute_approval(
+        session,
+        app_config,
+        registry,
+        decide_approval(session, approval, approved=True, decided_by="javier"),
+    )
+
+    assert task.state == TaskState.FAILED
+    assert "remote said no" in task.error
+
+
+async def test_the_tick_sweep_expires_overdue_approvals_and_settles_their_tasks(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    """approvals.expiry_hours only took effect if someone happened to open the approval;
+    nothing swept, so an unanswered task held a concurrency slot forever."""
+    import datetime as dt
+
+    from polska.db.enums import TaskState
+    from polska.gate import resolve_waiting_tasks
+
+    task, (approval,) = await _parked_task(session, app_config, registry, company, "email.send")
+    approval.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+    session.commit()
+
+    assert resolve_waiting_tasks(session) == 1
+    assert approval.status == ApprovalStatus.EXPIRED
+    assert task.state == TaskState.ABANDONED
+
+
+async def test_the_tick_sweep_settles_a_task_whose_approvals_were_already_executed(
+    session: Session, app_config: AppConfig, registry: AdapterRegistry, company: Company
+) -> None:
+    """The live case: tasks 26 and 27 were approved and executed before this existed."""
+    from polska.db.enums import TaskState
+    from polska.gate import resolve_waiting_tasks
+
+    task, (approval,) = await _parked_task(session, app_config, registry, company, "email.send")
+    approval.status = ApprovalStatus.EXECUTED
+    session.commit()
+
+    assert resolve_waiting_tasks(session) == 1
+    assert task.state == TaskState.DONE

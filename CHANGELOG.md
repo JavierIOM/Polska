@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-10-07
+
+Found by checking what Javier's first two approvals actually did. Both executed (dry
+run, nothing sent), but their tasks stayed `awaiting_approval`. The 0.9.0 full read
+missed this.
+
+### Fixed
+
+- **Nothing ever moved a task out of `awaiting_approval`**, whether its approvals were
+  executed, rejected or expired. That state counts against `max_concurrent_tasks`, so
+  with two tasks parked (26 and 27) no task would ever have been dispatched again. Once
+  none of a task's approvals is still waiting, the task now settles: every action
+  executed means done, any rejection or expiry means abandoned, and an approved action
+  that failed to execute means failed (the ordinary retry path decides what next). This
+  happens as each decision lands, and again at the start of every tick.
+- **Approvals now expire on time.** `approvals.expiry_hours` only took effect if someone
+  opened the approval after its window had passed; nothing swept for it. The per-tick
+  sweep now expires overdue approvals and settles their tasks.
+
+### Decided
+
+- Javier: leave the privilege-model change (the narrow `sudo` design) until the current
+  setup has been shown to work.
+
 ## [0.9.1] - 2026-10-07
 
 Documentation only: what 0.9.0 did live, and two corrections.

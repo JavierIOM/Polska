@@ -39,6 +39,7 @@ from polska.db.models import Goal, Run, Task
 from polska.db.state import ACTIVE_STATES
 from polska.db.types import utcday, utcnow
 from polska.dedup import deduplicate
+from polska.gate import resolve_waiting_tasks
 from polska.runner import AgentRunner
 from polska.schemas.planner import PlannerOutput, ProposedTask
 from polska.sync import reconcile_removed_companies, sync_company
@@ -459,6 +460,17 @@ def _reconcile_removed(session_factory: sessionmaker[Session], companies_dir: Pa
         )
 
 
+def _settle_approvals(session_factory: sessionmaker[Session]) -> None:
+    try:
+        with session_factory() as session:
+            settled = resolve_waiting_tasks(session)
+    except Exception:
+        logger.exception("Settling tasks awaiting approval failed; continuing with the tick.")
+        return
+    if settled:
+        logger.info("Moved %d task(s) out of awaiting_approval.", settled)
+
+
 def _reclaim_node_modules(
     session_factory: sessionmaker[Session], app_config: AppConfig, workspace_root: Path
 ) -> None:
@@ -510,6 +522,9 @@ async def run_tick_cycle(
             raise UnknownCompanyError(only_slug)
 
     _reconcile_removed(session_factory, companies_dir)
+    # Before the company ticks: a task still parked awaiting approval holds one of the
+    # max_concurrent_tasks slots, so settling them first frees capacity for this tick.
+    _settle_approvals(session_factory)
 
     result = CycleResult()
     for path in paths:

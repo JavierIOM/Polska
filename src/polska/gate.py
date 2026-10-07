@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import datetime as dt
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from polska.activity import log
 from polska.adapters.registry import AdapterRegistry
 from polska.config.appconfig import AppConfig
-from polska.db.enums import ActivityKind, ApprovalStatus, Reversibility
-from polska.db.models import Approval
+from polska.db.enums import ActivityKind, ApprovalStatus, Reversibility, TaskState
+from polska.db.models import Approval, Task
 from polska.db.types import utcnow
 from polska.schemas.actions import ActionRequest
 
@@ -178,6 +179,7 @@ def decide_approval(
             run_id=approval.run_id,
             approval_id=approval.id,
         )
+        resolve_task_after_decisions(session, approval.task_id)
         raise ApprovalAlreadyDecided(
             f"Approval {approval.id} expired at {approval.expires_at} before this "
             "decision was recorded."
@@ -204,6 +206,8 @@ def decide_approval(
         run_id=approval.run_id,
         approval_id=approval.id,
     )
+    if not approved:
+        resolve_task_after_decisions(session, approval.task_id)
     return approval
 
 
@@ -280,6 +284,8 @@ async def _run_adapter(
             approval_id=approval.id if approval else None,
             error=str(exc),
         )
+        if approval is not None:
+            resolve_task_after_decisions(session, approval.task_id)
         return approval
 
     # The adapter's own receipt, flattened rather than the whole AdapterResult
@@ -312,4 +318,106 @@ async def _run_adapter(
         approval_id=approval.id if approval else None,
         error=None if result.succeeded else result.error,
     )
+    if approval is not None:
+        resolve_task_after_decisions(session, approval.task_id)
     return approval
+
+
+#: Statuses that mean a decision or an execution is still to come.
+_STILL_WAITING = frozenset({ApprovalStatus.PENDING, ApprovalStatus.APPROVED})
+
+
+def resolve_task_after_decisions(
+    session: Session, task_id: int | None, *, now: dt.datetime | None = None
+) -> bool:
+    """Move a task out of ``awaiting_approval`` once none of its approvals is still
+    waiting. Returns True if the task moved.
+
+    Nothing did this before (7 Oct 2026): a task parked for approval stayed in
+    ``awaiting_approval`` for good, approved, rejected or expired alike, and since that
+    state counts against ``max_concurrent_tasks``, two of them stopped all dispatch.
+
+    Any rejection or expiry abandons the task (a human said no, or nobody answered);
+    an approved action that failed to execute fails it, so the ordinary retry path
+    decides what next; otherwise every action ran and it is done. Also expires any
+    pending approval whose window has passed, since nothing else sweeps for that.
+    """
+    if task_id is None:
+        return False
+    task = session.get(Task, task_id)
+    if task is None or task.state != TaskState.AWAITING_APPROVAL:
+        return False
+
+    moment = now or utcnow()
+    approvals = list(session.execute(select(Approval).where(Approval.task_id == task_id)).scalars())
+    for approval in approvals:
+        if approval.status == ApprovalStatus.PENDING and approval.is_expired(moment):
+            approval.status = ApprovalStatus.EXPIRED
+            log(
+                session,
+                company_id=approval.company_id,
+                kind=ActivityKind.APPROVAL_DECIDED,
+                summary=f"Expired before a decision arrived: {approval.action_type}",
+                task_id=task_id,
+                run_id=approval.run_id,
+                approval_id=approval.id,
+            )
+
+    statuses = {approval.status for approval in approvals}
+    if statuses & _STILL_WAITING:
+        session.commit()
+        return False
+
+    def types(status: ApprovalStatus) -> str:
+        return ", ".join(a.action_type for a in approvals if a.status == status)
+
+    if ApprovalStatus.REJECTED in statuses or ApprovalStatus.EXPIRED in statuses:
+        why = (
+            f"rejected: {types(ApprovalStatus.REJECTED)}"
+            if ApprovalStatus.REJECTED in statuses
+            else f"expired undecided: {types(ApprovalStatus.EXPIRED)}"
+        )
+        task.transition_to(
+            TaskState.ABANDONED,
+            result={
+                **(task.result or {}),
+                "abandoned_reason": f"An action it proposed was {why}.",
+                "abandoned_because": f"approval {why}",
+            },
+            now=moment,
+        )
+    elif ApprovalStatus.EXECUTION_FAILED in statuses:
+        errors = "; ".join(
+            a.execution_error or a.action_type
+            for a in approvals
+            if a.status == ApprovalStatus.EXECUTION_FAILED
+        )
+        task.transition_to(
+            TaskState.FAILED,
+            error=f"An approved action failed to execute: {errors}"[:2000],
+            now=moment,
+        )
+    else:
+        task.transition_to(TaskState.DONE, now=moment)
+
+    log(
+        session,
+        company_id=task.company_id,
+        kind=ActivityKind.TASK_STATE_CHANGED,
+        summary=f"Approvals settled, task now {task.state.value}: {task.title}",
+        task_id=task_id,
+    )
+    session.commit()
+    return True
+
+
+def resolve_waiting_tasks(session: Session, *, now: dt.datetime | None = None) -> int:
+    """Run :func:`resolve_task_after_decisions` for every task in ``awaiting_approval``.
+    Called once per tick, so expiry happens without anyone opening the dashboard, and so
+    a task whose approvals were settled before this existed is not stuck."""
+    waiting = (
+        session.execute(select(Task.id).where(Task.state == TaskState.AWAITING_APPROVAL))
+        .scalars()
+        .all()
+    )
+    return sum(resolve_task_after_decisions(session, task_id, now=now) for task_id in waiting)
