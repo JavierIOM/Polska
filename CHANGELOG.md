@@ -5,6 +5,38 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-10-07
+
+Documentation only: what 0.9.0 did live, and two corrections.
+
+### Verified live (0.9.0)
+
+- The full test suite passes on Linux in the droplet's own image, run as uid 1000, with
+  the four POSIX-only tests running rather than skipped. The one failure there is
+  `companies/example.yaml`, which was deleted on the droplet on purpose.
+- `_recover_structured_output`, replayed against the stored tool calls of eight real
+  runs, recovers a valid answer from all eight. The old version recovered none.
+- A tick through the exact cron line (19:40 UTC, after the halt was cleared on the
+  dashboard, $0.86): the planner's first reply was rejected and the 0.8.3 retry
+  recovered it (runs 81 and 82). Then came **the first successful engineering task**:
+  run 84 used 15 Bash calls, cost $0.46 and 189,685 tokens, and ran `npm test` (10/10),
+  `tsc` and `npm run build` with no workarounds, for a one-hunk diff. The analyst
+  succeeded too. Observations and `iterations_attempted` were stored.
+
+### Corrected
+
+- 0.8.9 said every engineer run was likely to hit the 750,000 token ceiling however
+  well it behaved. Run 84 finished at 189,685. Run 80 hit the ceiling partly because it
+  lost seven turns to the missing execute bits. The ceiling is still worth a look, but
+  it is not the certainty that entry claimed.
+- 0.9.0 said carscratch was halted. The halts were cleared on the dashboard at 19:30.
+
+### Waiting on Javier
+
+- Approval 1, `git.commit_and_push` (task 26, the DVLA log line), and approval 2,
+  `git.commit_file` (task 27, the MOT check plan). `force_dry_run` is on and only the
+  dry-run adapter exists, so approving either records it and nothing reaches GitHub.
+
 ## [0.9.0] - 2026-10-07
 
 A full read of the codebase after a run of reactive fixes. Each finding was checked
